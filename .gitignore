@@ -30,3 +30,4 @@ __pycache__/
 /*/experiments*.py
 /*/test.py
 /*/auto_preview.py
+.vscode/settings.json
