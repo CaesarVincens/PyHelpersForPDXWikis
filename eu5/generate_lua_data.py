@@ -5,7 +5,9 @@ Generates lua data modules
 """
 import luadata
 import sys
+import os
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from eu5.eu5_file_generator import Eu5FileGenerator
 
 
@@ -20,6 +22,15 @@ class LuaDataGenerator(Eu5FileGenerator):
 local NDefines = {luadata.serialize(result, indent=' ')}
 '''
 
+    def generate_defines_comments_lua(self) -> str:
+        """
+        generates https://eu5.paradoxwikis.com/Module:Defines/Comments
+
+        """
+        result = self.parser.define_commments.to_dict()
+        return f"""
+local NDefines = {luadata.serialize(result, indent=' ')}
+"""
     def generate_modifier_data_lua(self):
         result = {}
         for mod_type in self.parser.modifier_types.values():

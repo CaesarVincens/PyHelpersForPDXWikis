@@ -756,9 +756,28 @@ class Country(Eu5AdvancedEntity):
                 else:
                     kwargs[k] = v
 
+        if 'capital' in kwargs:
+            capital_value = kwargs['capital']
+            # Some setup entries provide lists; pick the first entry
+            if isinstance(capital_value, list) and len(capital_value) > 0:
+                capital_value = capital_value[0]
+            if isinstance(capital_value, str):
+                # Setup data can leave capital as a string; resolve to a Location object when possible
+                capital_value = eu5game.parser.locations.get(capital_value, capital_value)
+            kwargs['capital'] = capital_value
+
         super().__init__(name, display_name, **kwargs)
-        if self.country_name:
+
+        # Normalize display names for special cases
+        if self.name == 'MAM':
+            # Always render as Egypt without the tag suffix
+            self.display_name = 'Egypt'
+        elif self.country_name:
             self.display_name = f'{eu5game.parser.localize(self.country_name)}({self.name})'
+
+        # Ensure PAP uses Papal States regardless of localized country_name
+        if self.name == 'PAP':
+            self.display_name = 'Papal States'
 
     def has_flag(self, flag: str):
         if self.variables and 'data' in self.variables:
@@ -776,7 +795,14 @@ class Country(Eu5AdvancedEntity):
         return True
 
     def get_wiki_link_with_icon(self) -> str:
-        return f'{{{{flag|{self.display_name}}}}}'
+        # Egypt: keep the original flag target while showing the simplified label
+        if self.name == 'MAM':
+            return '{{flag|Egypt (MAM)|Egypt}}'
+
+        display_name = 'Papal States' if self.name == 'PAP' else self.display_name
+        if display_name == "Holy Roman":
+            display_name += " Empire"
+        return f'{{{{flag|{display_name}}}}}'
 
 
 class CultureGroup(NameableEntity):
@@ -2117,7 +2143,7 @@ class SubjectType(Eu5AdvancedEntity):
     allow_declaring_wars: bool = False
     annexation_min_opinion: int = 0
     annexation_min_years_before: int = None
-    annexation_speed: int
+    annexation_speed: int = None
     annexation_stall_opinion: int = 0
     can_attack: Trigger = None
     can_be_force_broken_in_peace_treaty: bool = True

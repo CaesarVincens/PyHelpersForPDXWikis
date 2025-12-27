@@ -1,10 +1,13 @@
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
+import os
 from operator import attrgetter
 
 import sys
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from common.paradox_lib import unsorted_groupby
 from common.paradox_parser import Tree
 from eu5.eu5_file_generator import Eu5FileGenerator
@@ -33,6 +36,45 @@ class TableGenerator(Eu5FileGenerator):
             section.append(content)
             result.append('\n'.join(section))
         return '\n'.join(result)
+
+    def infer_country_rank_key(self, country) -> str | None:
+        """Infer a reasonable country_rank when not explicitly set.
+
+        More conservative heuristic using unique provinces controlled:
+        - <= 2 provinces -> rank_county
+        - <= 5 provinces -> rank_duchy
+        - <= 12 provinces -> rank_kingdom
+        - > 12 provinces -> rank_empire
+
+        Returns a rank key like 'rank_county' or None if insufficient data.
+        """
+        candidates = [
+            'own_control_core', 'own_core', 'control',
+            'own_conquered', 'own_control_conquered', 'own_control_integrated', 'own_control_colony',
+        ]
+        provinces = set()
+        for attr in candidates:
+            if hasattr(country, attr):
+                value = getattr(country, attr)
+                if isinstance(value, list) and len(value) > 0:
+                    for loc in value:
+                        # value entries are Location objects due to parser annotations
+                        try:
+                            prov = loc.province
+                        except Exception:
+                            prov = None
+                        if prov is not None:
+                            provinces.add(prov)
+        n = len(provinces)
+        if n <= 0:
+            return 'rank_county'  # default to smallest when uncertain
+        if n <= 2:
+            return 'rank_county'
+        if n <= 5:
+            return 'rank_duchy'
+        if n <= 12:
+            return 'rank_kingdom'
+        return 'rank_empire'
 
     def get_building_notes(self, building: Building):
         result = []
@@ -624,6 +666,357 @@ class TableGenerator(Eu5FileGenerator):
                                     remove_empty_columns=True,
                                     )
 
+    def _generate_countries_by_region_tables(self):
+        countries = [country for country in self.parser.countries.values() if country.capital and country.capital.region and country.capital.region.sub_continent]
+
+        subcontinent_regions: dict = defaultdict(lambda: defaultdict(list))
+        for country in countries:
+            region = country.capital.region
+            subcontinent = region.sub_continent
+            subcontinent_regions[subcontinent][region].append(country)
+
+        def format_government(country):
+            parts = []
+
+            def _icon_link_from_text(text: str) -> str:
+                # Generic fallback: show a template icon and a wiki link to the text
+                return f'{{{{icon|{text}}}}} [[{text}]]'
+
+            # Government type (stored in government Tree)
+            if hasattr(country, 'government') and country.government and 'type' in country.government:
+                gov_type = country.government['type']
+                if gov_type in self.parser.government_types:
+                    gov_obj = self.parser.government_types[gov_type]
+                    parts.append(f'* {gov_obj.get_wiki_link_with_icon()}')
+                else:
+                    government_display = self.formatter.resolve_nested_localizations(
+                        self.parser.localize(gov_type, default=gov_type))
+                    parts.append(f'* {_icon_link_from_text(government_display)}')
+
+            # Country type (from setup_data: pop, building, etc.). Only show if NOT settled
+            if hasattr(country, 'setup_data') and country.setup_data and 'type' in country.setup_data:
+                country_type_key = country.setup_data['type']
+                # Skip "location" (settled countries) - only show non-settled types
+                if country_type_key != 'location':
+                    # Try to resolve as a game concept for proper display name
+                    concept = self.parser.game_concepts.get(country_type_key)
+                    if concept:
+                        # Use concept display name, but link to Country#Country_type
+                        display = concept.display_name
+                        file_name = f"Country {str(country_type_key).lower()}"
+                        link_target = f'Country#Country_type'
+                        parts.append(f"* [[File:{file_name}.png|24px|{display}|link={link_target}]] [[{link_target}|{display}]]")
+                    else:
+                        country_type_display = self.formatter.resolve_nested_localizations(
+                            self.parser.localize(country_type_key, default=country_type_key.capitalize()))
+                        file_name = f"Country {str(country_type_key).lower()}"
+                        link_target = f'Country#Country_type'
+                        parts.append(f"* [[File:{file_name}.png|24px|{country_type_display}|link={link_target}]] [[{link_target}|{country_type_display}]]")
+
+            # Country rank
+            rank_key = country.country_rank if hasattr(country, 'country_rank') and country.country_rank else self.infer_country_rank_key(country)
+            if rank_key:
+                if rank_key in self.parser.country_ranks:
+                    rank_obj = self.parser.country_ranks[rank_key]
+                    # Explicit Rank icon: [[File:Rank <rank>.png]] + link
+                    display = rank_obj.display_name
+                    link_target = rank_obj.get_wiki_link_target()
+                    file_name = f"Rank {display.lower()}"
+                    parts.append(f"* [[File:{file_name}.png|24px|{display}|link={link_target}]] [[{link_target}|{display}]]")
+                else:
+                    rank_display = self.formatter.resolve_nested_localizations(
+                        self.parser.localize(rank_key, default=rank_key))
+                    file_name = f"Rank {rank_display.lower()}"
+                    page = 'Country rank'
+                    anchor = rank_display
+                    parts.append(f"* [[File:{file_name}.png|24px|{anchor}|link={page}#{anchor}]] [[{page}#{anchor}|{anchor}]]")
+
+            return '\n' + '\n'.join(parts) if parts else ''
+
+        def format_nameable(value):
+            if hasattr(value, 'display_name'):
+                return value.display_name
+            if value:
+                return self.formatter.resolve_nested_localizations(self.parser.localize(str(value), default=str(value)))
+            return ''
+
+        def format_religion(value):
+            """Return icon + custom link for Religion per spec:
+
+            - Catholic ? link to "Catholicism"
+            - Non-Catholic ? link to "List of religions#<Display Name>"
+            - Preserve icon if Religion entity is available
+            - Fallback: formatted name only
+            """
+            if not value:
+                return ''
+
+            def _format_with_target(rel_obj, display_name):
+                is_catholic = (getattr(rel_obj, 'name', '').lower() == 'catholic') or (display_name.lower() == 'catholicism')
+                link_target = 'Catholicism' if is_catholic else f'List of religions#{display_name}'
+                # Use entity icon when available; otherwise no icon
+                if hasattr(rel_obj, 'get_wiki_file_tag'):
+                    icon = rel_obj.get_wiki_file_tag('24px', link=link_target) or ''
+                else:
+                    icon = ''
+                text = f'[[{link_target}|{display_name}]]'
+                return f'{icon} {text}'.strip()
+
+            # Entity path
+            if hasattr(value, 'display_name'):
+                return _format_with_target(value, value.display_name)
+
+            # Key path ? resolve entity
+            if isinstance(value, str):
+                rel = self.parser.religions.get(value)
+                if rel:
+                    return _format_with_target(rel, rel.display_name)
+                # Fallback to using localized display name without icon
+                display_name = self.parser.localize(value)
+                is_catholic = value.lower() == 'catholic' or display_name.lower() == 'catholicism'
+                link_target = 'Catholicism' if is_catholic else f'List of religions#{display_name}'
+                return f'[[{link_target}|{display_name}]]'
+
+            # Final fallback
+            return format_nameable(value)
+
+        def build_country_table_rows(countries_list):
+            """Build table rows for a list of countries."""
+            table_rows = []
+            for country in countries_list:
+                notes, nested_details = get_country_notes(country)
+
+                # Compose notes cell with optional nested details
+                if notes and nested_details:
+                    notes_cell = self.create_wiki_list(notes) + '\n' + self.create_wiki_list(nested_details, indent=2)
+                elif notes:
+                    notes_cell = self.create_wiki_list(notes)
+                else:
+                    notes_cell = ''
+
+                # Country cell: image + bold name - NO LINKS in Country Name column
+                country_display = country.display_name
+                if country.name == 'MAM':  # ensure Egypt renders without tag suffix
+                    country_display = 'Egypt'
+                
+                # Country name column should have no links at all
+                country_image = f'[[File:{country_display}.png|100px]]'
+                country_cell = f"{country_image} '''{country_display}'''"
+                
+                table_rows.append({
+                    'Country': country_cell,
+                    'Tag': country.name,
+                    'Government': format_government(country),
+                    'Religion': format_religion(country.religion_definition),
+                    'Culture': format_nameable(country.culture_definition),
+                    'Capital': format_nameable(country.capital),
+                    'Notes': notes_cell,
+                })
+            return table_rows
+
+        def get_country_notes(country):
+            """Extract important notes for a country including:
+            - Subject status and type
+            - IO membership (excluding Catholic IO)
+            - Non-existent countries (cores conquered but none controlled)
+            
+            Returns a tuple: (top_level_notes: list[str], nested_details: list[str]|None)
+            """
+            notes: list[str] = []
+            nested_details: list[str] | None = None
+
+            # Formable: match by formable country script name to country tag
+            # Defer appending so it appears beneath other notes
+            is_formable = any(
+                fc.country_name == country.name
+                for fc in self.parser.formable_countries.values()
+            )
+
+            # Non-existent country: has cores conquered by others but doesn't control any of its own cores
+            has_conquered_cores = hasattr(country, 'our_cores_conquered_by_others') and len(country.our_cores_conquered_by_others) > 0
+            has_owned_cores = (
+                (hasattr(country, 'own_control_core') and len(country.own_control_core) > 0) or
+                (hasattr(country, 'own_core') and len(country.own_core) > 0) or
+                (hasattr(country, 'own_conquered') and len(country.own_conquered) > 0) or
+                (hasattr(country, 'own_control_conquered') and len(country.own_control_conquered) > 0) or
+                (hasattr(country, 'own_control_integrated') and len(country.own_control_integrated) > 0) or
+                (hasattr(country, 'own_control_colony') and len(country.own_control_colony) > 0) or
+                (hasattr(country, 'control') and len(country.control) > 0)
+            )
+            
+            if has_conquered_cores and not has_owned_cores:
+                notes.append('Does not exist in 1337')
+
+            # Subject/overlord and IO memberships
+            if hasattr(self.parser, 'diplomacy_relationships'):
+                diplo_rels = self.parser.diplomacy_relationships
+                io_member_laws = diplo_rels.get('io_member_laws', {})
+
+                # Subject relationship
+                if country.name in diplo_rels['overlords']:
+                    overlord_tag = diplo_rels['overlords'][country.name]
+                    subject_type = diplo_rels['subject_types'].get(country.name, 'subject')
+                    if subject_type in self.parser.subject_types:
+                        st = self.parser.subject_types[subject_type]
+                        subject_display = st.get_wiki_link_with_icon()
+                    else:
+                        subject_display = subject_type.capitalize()
+
+                    if overlord_tag in self.parser.countries:
+                        overlord_country = self.parser.countries[overlord_tag]
+                        overlord_flag = overlord_country.get_wiki_link_with_icon()
+                    else:
+                        overlord_flag = f'{{{{flag|{overlord_tag}}}}}'
+
+                    notes.append(f'{subject_display} of {overlord_flag}')
+
+                # IO membership (skip Catholic-specific entries)
+                if country.name in diplo_rels['io_members']:
+                    io_names = diplo_rels['io_members'][country.name]
+                    for io_name in io_names:
+                        if io_name.lower() not in ['catholic_church', 'papacy']:
+                            if io_name in self.parser.international_organizations:
+                                # Special handling for Hindu Branch to show specific branch policy
+                                if io_name.lower() == 'hindu_branch':
+                                    branch_display = None
+                                    branch_laws = io_member_laws.get(country.name, {}).get(io_name, [])
+                                    if branch_laws:
+                                        branch_key = branch_laws[0]
+                                        if branch_key in self.parser.law_policies:
+                                            branch_display = self.parser.law_policies[branch_key].display_name
+                                        elif branch_key in self.parser.laws:
+                                            branch_display = self.parser.laws[branch_key].display_name
+                                        else:
+                                            branch_display = branch_key.replace('_', ' ').title()
+
+                                    if branch_display:
+                                        branch_file = branch_display.lower()
+                                        notes.append(f'Member of [[File:IO {branch_file}.png|24px]] [[International organization#Hindu Branches|{branch_display}]]')
+                                        continue
+
+                                io_obj = self.parser.international_organizations[io_name]
+                                notes.append(f'Member of {io_obj.get_wiki_link_with_icon()}')
+                            else:
+                                notes.append(f'Member of {{{{iconify|{io_name}}}}}')
+
+            # Ensure Formable note appears last
+            if is_formable:
+                notes.append('[[File:Country rank.png|24px|link=Formable countries]] [[Formable countries|Formable Country]]')
+
+            return notes, nested_details
+
+        outputs: dict[str, str] = {}
+        # Track German regions for separate output
+        german_region_names = {'north_german_region', 'south_german_region'}
+        german_regions_data = {}
+        # Track Japan region for separate output
+        japan_region_names = {'japan_region'}
+        japan_regions_data = {}
+        # Track Africa subcontinents for consolidated output
+        africa_data: dict[str, list] = {}
+        
+        for subcontinent in sorted(subcontinent_regions.keys(), key=lambda sc: sc.display_name):
+            # Check if this subcontinent is in Africa
+            is_africa = subcontinent.continent and subcontinent.continent.display_name.lower() == 'africa'
+            
+            # Initialize Africa data structure if needed
+            if is_africa and subcontinent.name not in africa_data:
+                africa_data[subcontinent] = []
+            
+            # Remove subcontinent header; start directly with region sections
+            subcontinent_lines: list[str] = []
+
+            for region in sorted(subcontinent_regions[subcontinent].keys(), key=lambda r: r.display_name):
+                # Separate German regions from Western Europe
+                if region.name in german_region_names:
+                    german_regions_data[region] = subcontinent_regions[subcontinent][region]
+                    continue
+                
+                # Separate Japan region from East Asia
+                if region.name in japan_region_names:
+                    japan_regions_data[region] = subcontinent_regions[subcontinent][region]
+                    continue
+                
+                countries_in_region = sorted(subcontinent_regions[subcontinent][region], key=lambda country: country.display_name)
+                if not countries_in_region:
+                    continue
+
+                table_rows = build_country_table_rows(countries_in_region)
+
+                # For Africa, use level 3 headers for regions (level 2 reserved for subcontinent)
+                # For other continents, use level 2 headers
+                if is_africa:
+                    region_header = f'=== {region.display_name} ==='
+                else:
+                    region_header = f'== {region.display_name} =='
+                
+                subcontinent_lines.append(region_header)
+                subcontinent_lines.append(self.make_wiki_table(table_rows,
+                                                                table_classes=['mildtable', 'plainlist'],
+                                                                one_line_per_cell=True,
+                                                                ))
+                subcontinent_lines.append('')  # blank line to terminate table before next heading
+
+            # Store Africa subcontinents' data for consolidation, others write directly to outputs
+            if is_africa:
+                africa_data[subcontinent] = subcontinent_lines
+            else:
+                outputs[subcontinent.name] = '\n'.join(subcontinent_lines).rstrip()
+
+        # Consolidate Africa subcontinents into one file
+        if africa_data:
+            africa_lines: list[str] = []
+            for subcontinent in sorted(africa_data.keys(), key=lambda sc: sc.display_name):
+                # Add subcontinent header (level 2)
+                africa_lines.append(f'== {subcontinent.display_name} ==')
+                # Add all regions and tables for this subcontinent
+                africa_lines.extend(africa_data[subcontinent])
+            
+            outputs['africa'] = '\n'.join(africa_lines).rstrip()
+
+        # Generate separate output for German regions
+        if german_regions_data:
+            german_lines: list[str] = []
+            for region in sorted(german_regions_data.keys(), key=lambda r: r.display_name):
+                countries_in_region = sorted(german_regions_data[region], key=lambda country: country.display_name)
+                if not countries_in_region:
+                    continue
+
+                table_rows = build_country_table_rows(countries_in_region)
+                german_lines.append(f'== {region.display_name} ==')
+                german_lines.append(self.make_wiki_table(table_rows,
+                                                          table_classes=['mildtable', 'plainlist'],
+                                                          one_line_per_cell=True,
+                                                          ))
+                german_lines.append('')  # blank line to terminate table before next heading
+
+            outputs['german'] = '\n'.join(german_lines).rstrip()
+
+        # Generate separate output for Japan region
+        if japan_regions_data:
+            japan_lines: list[str] = []
+            for region in sorted(japan_regions_data.keys(), key=lambda r: r.display_name):
+                countries_in_region = sorted(japan_regions_data[region], key=lambda country: country.display_name)
+                if not countries_in_region:
+                    continue
+
+                table_rows = build_country_table_rows(countries_in_region)
+                japan_lines.append(f'== {region.display_name} ==')
+                japan_lines.append(self.make_wiki_table(table_rows,
+                                                         table_classes=['mildtable', 'plainlist'],
+                                                         one_line_per_cell=True,
+                                                         ))
+                japan_lines.append('')  # blank line to terminate table before next heading
+
+            outputs['japan'] = '\n'.join(japan_lines).rstrip()
+
+        return outputs
+
+
+    def generate_countries(self):
+        """Alias so the module can be run with `python -m eu5.generate_tables countries`."""
+        return self._generate_countries_by_region_tables()
+
 
     # AUTOGENERATED
 
@@ -749,29 +1142,301 @@ class TableGenerator(Eu5FileGenerator):
                                         )
     def generate_government_reforms_table(self):
         government_reformss = self.parser.government_reforms.values()
-        government_reforms_table_data = [{
+        
+        # Split into major and minor reforms
+        major_reforms = [reform for reform in government_reformss if reform.major]
+        minor_reforms = [reform for reform in government_reformss if not reform.major]
+        
+        result = []
+        
+        # Process minor reforms
+        if minor_reforms:
+            result.append('== Minor ==')
+            country_specific_minor = [r for r in minor_reforms if self._get_country_from_reform(r) is not None]
+            general_minor = [r for r in minor_reforms if self._get_country_from_reform(r) is None]
+            
+            # General minor reforms table
+            if general_minor:
+                government_reforms_table_data = [self._get_government_reform_row(government_reforms) for government_reforms in general_minor]
+                result.append(self.make_wiki_table(government_reforms_table_data, table_classes=['mildtable', 'plainlist'],
+                                                    one_line_per_cell=True,
+                                                    remove_empty_columns=True,
+                                                    ))
+            
+            # Country-specific minor reforms table
+            if country_specific_minor:
+                result.append('=== Country specific ===')
+                government_reforms_table_data = [self._get_government_reform_row(government_reforms, country=self._get_country_from_reform(government_reforms)) for government_reforms in country_specific_minor]
+                result.append(self.make_wiki_table(government_reforms_table_data, table_classes=['mildtable', 'plainlist'],
+                                                    one_line_per_cell=True,
+                                                    remove_empty_columns=True,
+                                                    ))
+        
+        # Process major reforms
+        if major_reforms:
+            result.append('== Major ==')
+            country_specific_major = [r for r in major_reforms if self._get_country_from_reform(r) is not None]
+            general_major = [r for r in major_reforms if self._get_country_from_reform(r) is None]
+            
+            # General major reforms table
+            if general_major:
+                government_reforms_table_data = [self._get_government_reform_row(government_reforms) for government_reforms in general_major]
+                result.append(self.make_wiki_table(government_reforms_table_data, table_classes=['mildtable', 'plainlist'],
+                                                    one_line_per_cell=True,
+                                                    remove_empty_columns=True,
+                                                    ))
+            
+            # Country-specific major reforms table
+            if country_specific_major:
+                result.append('=== Country specific ===')
+                government_reforms_table_data = [self._get_government_reform_row(government_reforms, country=self._get_country_from_reform(government_reforms)) for government_reforms in country_specific_major]
+                result.append(self.make_wiki_table(government_reforms_table_data, table_classes=['mildtable', 'plainlist'],
+                                                    one_line_per_cell=True,
+                                                    remove_empty_columns=True,
+                                                    ))
+        
+        return result
+    
+    def _get_country_from_reform(self, reform):
+        """Extract country tag(s) from has_or_had_tag requirement if present"""
+        for trigger_obj in [reform.allow, reform.potential, reform.locked]:
+            if trigger_obj is None:
+                continue
+            countries = self._find_has_or_had_tag_in_trigger(trigger_obj)
+            if countries:
+                return countries
+        return None
+    
+    def _find_has_or_had_tag_in_trigger(self, trigger_tree):
+        """Recursively search trigger tree for has_or_had_tag and return the country tag(s)"""
+        from common.paradox_parser import Tree
+        
+        if not isinstance(trigger_tree, Tree):
+            return None
+        
+        for key, value in trigger_tree:
+            if key == 'has_or_had_tag':
+                # Can be a single string or a list of strings
+                return value
+            elif isinstance(value, Tree):
+                result = self._find_has_or_had_tag_in_trigger(value)
+                if result:
+                    return result
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, Tree):
+                        result = self._find_has_or_had_tag_in_trigger(item)
+                        if result:
+                            return result
+        
+        return None
+    
+    def _get_government_reform_row(self, government_reforms, country=None):
+        effects_parts = []
+
+        country_mod = self.format_modifier_section('country_modifier', government_reforms)
+        if country_mod:
+            effects_parts.append(('Country Modifier', country_mod))
+
+        location_mod = self.format_modifier_section('location_modifier', government_reforms)
+        if location_mod:
+            effects_parts.append(('Location Modifier', location_mod))
+
+        on_activate = self.formatter.format_effect(government_reforms.on_activate)
+        if on_activate:
+            effects_parts.append(('On Activate', on_activate))
+
+        on_deactivate = self.formatter.format_effect(government_reforms.on_deactivate)
+        if on_deactivate:
+            effects_parts.append(('On Deactivate', on_deactivate))
+
+        # Build effects_combined based on number of sections
+        if not effects_parts:
+            effects_combined = ''
+        elif len(effects_parts) == 1:
+            # Single effect type - no heading
+            effects_combined = effects_parts[0][1]
+        else:
+            # Multiple effect types - use nested bullet list with bold headings
+            effects_lines = []
+            for title, content in effects_parts:
+                effects_lines.append(f"* '''{title}:'''")
+                effects_lines.extend(self._nest_wiki_list(content, extra_depth=1))
+            effects_combined = '\n' + '\n'.join(effects_lines)
+        
+        # Build requirements_combined with similar logic but handling locked conditions specially
+        government_text = '' if government_reforms.government is None else government_reforms.government.get_wiki_link_with_icon() if government_reforms.government else ''
+        societal_values_text = self.create_wiki_list([sv for sv in government_reforms.societal_values]) if government_reforms.societal_values else ''
+        
+        # Filter out has_or_had_tag from potential, allow, and locked when country-specific
+        potential_text = self._format_trigger_filtered(government_reforms.potential, country)
+        allow_text = self._format_trigger_filtered(government_reforms.allow, country)
+        locked_text = self._format_trigger_filtered(government_reforms.locked, country)
+        
+        requirements_parts = []
+        if government_text:
+            requirements_parts.append(('Government', government_text))
+        if societal_values_text:
+            requirements_parts.append(('Societal Values', societal_values_text))
+        if potential_text:
+            requirements_parts.append(('Potential', potential_text))
+        if allow_text:
+            requirements_parts.append(('Allow', allow_text))
+        
+        # Build requirements_combined based on whether there's a locked condition
+        if not requirements_parts and not locked_text:
+            requirements_combined = ''
+        elif not locked_text:
+            # No locked condition - just combine all requirements without headings
+            requirements_combined = '\n'.join([content for title, content in requirements_parts])
+        else:
+            # Has locked condition - split into unlocked and locked sections
+            unlocked_lines = []
+            if requirements_parts:
+                unlocked_lines.append(f"* '''Reform is unlocked as long as:'''")
+                for title, content in requirements_parts:
+                    unlocked_lines.extend(self._nest_wiki_list(content, extra_depth=1))
+            
+            locked_lines = []
+            locked_lines.append(f"* '''Reform is locked as long as:'''")
+            locked_lines.extend(self._nest_wiki_list(locked_text, extra_depth=1))
+            
+            if unlocked_lines:
+                requirements_combined = '\n' + '\n'.join(unlocked_lines) + '\n\n----\n\n' + '\n'.join(locked_lines)
+            else:
+                requirements_combined = '\n' + '\n'.join(locked_lines)
+        
+        row_dict = {
             'Name': f'{{{{iconbox|{government_reforms.display_name}|{government_reforms.description}|w=300px|image={government_reforms.get_wiki_filename()}}}}}',
             'Age': '' if government_reforms.age is None else government_reforms.age.get_wiki_link_with_icon() if government_reforms.age else '',  # age: <class 'eu5.eu5lib.Age'>
-            'Allow': self.formatter.format_trigger(government_reforms.allow),  # allow: <class 'eu5.trigger.Trigger'>
-            'Block For Rebel': '[[File:Yes.png|20px|Block For Rebel]]' if government_reforms.block_for_rebel else '[[File:No.png|20px|Not Block For Rebel]]',  # block_for_rebel: <class 'bool'>
-            'Country Modifier': self.format_modifier_section('country_modifier', government_reforms),  # country_modifier: list[eu5.eu5lib.Eu5Modifier]
-            'Government': '' if government_reforms.government is None else government_reforms.government.get_wiki_link_with_icon() if government_reforms.government else '',  # government: <class 'eu5.eu5lib.GovernmentType'>
-            'Location Modifier': self.format_modifier_section('location_modifier', government_reforms),  # location_modifier: list[eu5.eu5lib.Eu5Modifier]
-            'Locked': self.formatter.format_trigger(government_reforms.locked),  # locked: <class 'eu5.trigger.Trigger'>
-            'Major': '[[File:Yes.png|20px|Major]]' if government_reforms.major else '[[File:No.png|20px|Not Major]]',  # major: <class 'bool'>
-            'Male Regnal Names': self.create_wiki_list([male_regnal_names for male_regnal_names in government_reforms.male_regnal_names]),  # male_regnal_names: list[str]
-            'Months': government_reforms.months,  # months: <class 'int'>
-            'On Activate': self.formatter.format_effect(government_reforms.on_activate),  # on_activate: <class 'eu5.effect.Effect'>
-            'On Deactivate': self.formatter.format_effect(government_reforms.on_deactivate),  # on_deactivate: <class 'eu5.effect.Effect'>
-            'Potential': self.formatter.format_trigger(government_reforms.potential),  # potential: <class 'eu5.trigger.Trigger'>
-            'Societal Values': self.create_wiki_list([societal_values for societal_values in government_reforms.societal_values]),  # societal_values: list[str]
-            'Unique': '[[File:Yes.png|20px|Unique]]' if government_reforms.unique else '[[File:No.png|20px|Not Unique]]',  # unique: <class 'bool'>
-            'Years': '' if government_reforms.years is None else government_reforms.years,  # years: <class 'float'>
-        } for government_reforms in government_reformss]
-        return self.make_wiki_table(government_reforms_table_data, table_classes=['mildtable', 'plainlist'],
-                                        one_line_per_cell=True,
-                                        remove_empty_columns=True,
-                                        )
+            'Effects': effects_combined,  # merged: country_modifier, location_modifier, on_activate, on_deactivate
+            'Requirements': requirements_combined,  # merged: government, societal_values, potential, allow, locked
+            # 'Allow': allow_text,  # allow: <class 'eu5.trigger.Trigger'>  [MERGED INTO Requirements]
+            # 'Country Modifier': self.format_modifier_section('country_modifier', government_reforms),  # country_modifier: list[eu5.eu5lib.Eu5Modifier]  [MERGED INTO Effects]
+            # 'Government': government_text,  # government: <class 'eu5.eu5lib.GovernmentType'>  [MERGED INTO Requirements]
+            # 'Location Modifier': self.format_modifier_section('location_modifier', government_reforms),  # location_modifier: list[eu5.eu5lib.Eu5Modifier]  [MERGED INTO Effects]
+            # 'Locked': locked_text,  # locked: <class 'eu5.trigger.Trigger'>  [MERGED INTO Requirements]
+            # 'On Activate': self.formatter.format_effect(government_reforms.on_activate),  # on_activate: <class 'eu5.effect.Effect'>  [MERGED INTO Effects]
+            # 'On Deactivate': self.formatter.format_effect(government_reforms.on_deactivate),  # on_deactivate: <class 'eu5.effect.Effect'>  [MERGED INTO Effects]
+            # 'Potential': potential_text,  # potential: <class 'eu5.trigger.Trigger'>  [MERGED INTO Requirements]
+            # 'Societal Values': self.create_wiki_list([societal_values for societal_values in government_reforms.societal_values]),  # societal_values: list[str]  [MERGED INTO Requirements]
+            'Years': (f'{government_reforms.years} years' if government_reforms.years else f'{government_reforms.months} months' if government_reforms.months else ''),  # years: <class 'float'>
+        }
+        
+        # Add Country column if this is a country-specific reform
+        if country:
+            country_flags = self._format_country_flags(country)
+            row_dict['Country'] = country_flags
+        
+        return row_dict
+    
+    def _format_country_flags(self, country_data):
+        """Format country tag(s) as flag(s). Handles both single strings and lists."""
+        # Normalize to list
+        countries = country_data if isinstance(country_data, list) else [country_data]
+
+        # Remove 'c:' prefix from each country tag
+        countries = [c.removeprefix('c:') for c in countries]
+
+        # Create flag wiki markup for each country
+        flag_list = []
+        for country_tag in countries:
+            country_name = self._get_country_display_name(country_tag)
+            flag_list.append(f'{{{{flag|{country_name}}}}}')
+
+        # Return as wiki list if multiple countries, otherwise single flag
+        if len(flag_list) == 1:
+            return flag_list[0]
+        else:
+            return self.create_wiki_list(flag_list)
+
+    def _get_country_display_name(self, country_tag: str) -> str:
+        """Return localized country name for flag template, falling back to tag."""
+        # Prefer full country set (including formables) if available
+        country_lookup = getattr(self.parser, 'countries_including_formables', None) or self.parser.countries
+
+        # Normalize tag
+        norm_tag = country_tag.upper()
+
+        if norm_tag in country_lookup:
+            country_obj = country_lookup[norm_tag]
+            # display_name already localized and may include tag suffix; strip suffix if present
+            return country_obj.display_name.split('(')[0].strip()
+
+        # Fallback: try localization on tag itself
+        localized = self.parser.localize(norm_tag)
+        if localized and localized != norm_tag:
+            return localized
+
+        return norm_tag
+    
+    def _format_trigger_filtered(self, trigger_tree, country):
+        """Format trigger while filtering out has_or_had_tag if country-specific"""
+        if trigger_tree is None:
+            return ''
+        
+        if not country:
+            return self.formatter.format_trigger(trigger_tree)
+        
+        # Filter out has_or_had_tag entries for country-specific reforms
+        filtered_tree = self._filter_has_or_had_tag(trigger_tree)
+        return self.formatter.format_trigger(filtered_tree) if filtered_tree else ''
+    
+    def _filter_has_or_had_tag(self, trigger_tree):
+        """Remove has_or_had_tag entries from trigger tree"""
+        from common.paradox_parser import Tree
+        
+        if not isinstance(trigger_tree, Tree):
+            return trigger_tree
+        
+        filtered = Tree({})
+        for key, value in trigger_tree:
+            if key == 'has_or_had_tag':
+                # Skip this entry
+                continue
+            elif isinstance(value, Tree):
+                filtered_value = self._filter_has_or_had_tag(value)
+                if filtered_value and len(filtered_value) > 0:
+                    filtered[key] = filtered_value
+            elif isinstance(value, list):
+                filtered_list = []
+                for item in value:
+                    if isinstance(item, Tree):
+                        filtered_item = self._filter_has_or_had_tag(item)
+                        if filtered_item and len(filtered_item) > 0:
+                            filtered_list.append(filtered_item)
+                    else:
+                        filtered_list.append(item)
+                if filtered_list:
+                    filtered[key] = filtered_list
+            else:
+                filtered[key] = value
+        
+        return filtered
+
+    def _nest_wiki_list(self, text: str, extra_depth: int = 1) -> list[str]:
+        """Indent existing wiki-list style text by extra_depth levels.
+
+        Preserves existing bullet depth (leading `*`) and adds extra_depth more.
+        If a line has no bullet, it becomes a bullet at the new depth.
+        Empty lines are skipped.
+        """
+        nested_lines: list[str] = []
+
+        for line in text.split('\n'):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            leading_stars = len(line) - len(line.lstrip('*'))
+            base_depth = leading_stars if leading_stars > 0 else 1  # ensure at least one bullet
+            new_depth = base_depth + extra_depth
+
+            # Remove existing stars and leading whitespace for the payload
+            payload = line.lstrip('*').strip()
+            nested_lines.append(f"{'*' * new_depth} {payload}")
+
+        return nested_lines
     def generate_holy_sites_table(self):
         holy_sitess = self.parser.holy_sites.values()
         holy_sites_table_data = [{
@@ -1124,6 +1789,54 @@ class TableGenerator(Eu5FileGenerator):
                                         remove_empty_columns=True,
                                         )
 
-
+    def generate_country_count(self):
+        locations = self.parser.locations
+        count = {
+            'province': {},
+            'area': {},
+            'region': {},
+            'sub_continent': {},
+            'continent': {},
+        }
+        countries = self.parser.countries.values()
+        for country in countries:
+            if not country.capital:
+                #print(country)
+                continue
+            capital = country.capital
+            if isinstance(capital, str) and capital in locations:
+                capital = locations[capital]
+            elif isinstance(capital, list) and capital[0] in locations:
+                capital = locations[capital[0]]
+            
+            if capital.province:
+                if capital.province.display_name not in count['province']: count['province'][capital.province.display_name] = 0
+                count['province'][capital.province.display_name] += 1
+            if capital.area:
+                if capital.area.display_name not in count['area']: count['area'][capital.area.display_name] = 0
+                count['area'][capital.area.display_name] += 1
+            if capital.region:
+                if capital.region.display_name not in count['region']: count['region'][capital.region.display_name] = 0
+                count['region'][capital.region.display_name] += 1
+            if capital.sub_continent:
+                if capital.sub_continent.display_name not in count['sub_continent']: count['sub_continent'][capital.sub_continent.display_name] = 0
+                count['sub_continent'][capital.sub_continent.display_name] += 1
+            if capital.continent:
+                if capital.continent.display_name not in count['continent']: count['continent'][capital.continent.display_name] = 0
+                count['continent'][capital.continent.display_name] += 1
+        print(count)
+        table = {}
+        result = ''
+        for ctype in count.keys():
+            #print(ctype)
+            #continue
+            table = [{
+                ctype.capitalize(): name,
+                'Count': count[ctype][name]
+            } for name in count[ctype]]
+            #print(table)
+            result += self.make_wiki_table(table) 
+        return result
+    
 if __name__ == '__main__':
     TableGenerator().run(sys.argv)
