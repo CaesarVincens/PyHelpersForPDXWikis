@@ -14,6 +14,11 @@ from common.paradox_parser import ParsingWorkaround
 
 
 class Eu5Parser(JominiParser):
+    _class_property_map_overrides: dict[Type[NE], str] = {
+        Location: 'locations',
+        Country: 'countries_including_formables',
+        Language: 'languages_including_dialects',
+    }
 
     # allows the overriding of localization strings
     localizationOverrides = {
@@ -304,6 +309,16 @@ class Eu5Parser(JominiParser):
         return self._map_entities[4]
 
     @cached_property
+    def _tag_specific_descriptions(self) -> dict[str, str]:
+        tag_to_description = {}
+        for custom_loc in self.customizable_localization['country_history'].text.values():
+            if not custom_loc.fallback:
+                for tag in custom_loc.trigger.find_all_recursively('tag'):
+                    tag_to_description[tag] = custom_loc.display_name
+
+        return tag_to_description
+
+    @cached_property
     def country_description_categories(self) -> dict[str, CountryDescriptionCategory]:
         return self.parse_nameable_entities('in_game/common/country_description_categories', CountryDescriptionCategory,
                                             allow_empty_entities=True,
@@ -317,17 +332,31 @@ class Eu5Parser(JominiParser):
     @cached_property
     @disk_cache(eu5game, classes_to_cache={Country})
     def countries(self) -> dict[str, Country]:
-        return self.parse_advanced_entities('in_game/setup/countries', Country,
+        """countries from in_game/setup/countries with additional data from main_menu/setup """
+
+        countries_from_ingame_setup = self.parser.parse_folder_as_one_file('in_game/setup/countries')
+        tag: str
+        country_data: Tree
+        for tag, country_data in countries_from_ingame_setup:
+            if tag in self.setup_data['countries']['countries']:
+               country_data.update(self.setup_data['countries']['countries'][tag])
+
+        return self.parse_advanced_entities(countries_from_ingame_setup, Country,
                                             transform_value_functions={
+                                                'currency_data': lambda currency_data: [
+                                                    ResourceValue.create_with_hardcoded_resource(key, value) for key, value in
+                                                    currency_data if key in HardcodedResource],
                                                 # @TODO: remove this workaround for duplicate description_category sections
                                                 'description_category': lambda cat: self.country_description_categories[
                                                     cat if isinstance(cat, str) else cat[0]],
                                             },
                                             extra_data_functions={
-                                                'setup_data': lambda tag, data: self.setup_data['countries']['countries'][tag] if tag in
-                                                                                                                                  self.setup_data['countries'][
-                                                                                                                                      'countries'] else None
-                                            })
+                                                # the default rank seems to be county. Pass it as extra data, so that it is set
+                                                # in the object instead of in the class, so that it gets cached correctly
+                                                'default_rank': lambda name, data: self.country_ranks['rank_county'],
+                                                'description': lambda name, data: self._tag_specific_descriptions.get(name, ''),
+                                            }
+        )
 
     @cached_property
     def countries_including_formables(self): # -> dict[str, Country|FormableCountry]:
@@ -340,6 +369,7 @@ class Eu5Parser(JominiParser):
     @cached_property
     @disk_cache(eu5game)
     def setup_data(self) -> Tree:
+        """main_menu/setup including templates"""
         template_data_without_include = {
             filename.stem: self._fix_law_values(data)
             for filename, data in self.parser.parse_files('main_menu/setup/templates/*.txt')
@@ -570,6 +600,11 @@ class Eu5Parser(JominiParser):
         return relationships
 
     @cached_property
+    def earthquakes(self) -> dict[str, Location]:
+        """earthquake zone locations from the earthquakes list in game/in_game/map_data/default.map """
+        return {name: self.locations[name] for name in self.default_map['earthquakes']}
+
+    @cached_property
     def estates(self) -> dict[str, Estate]:
         return self.parse_advanced_entities('in_game/common/estates', Estate)
 
@@ -608,8 +643,18 @@ class Eu5Parser(JominiParser):
         return self.parse_advanced_entities('in_game/common/government_types', GovernmentType)
 
     @cached_property
+    def impassable_mountains(self) -> dict[str, Location]:
+        """wasteland locations from the impassable_mountains list in game/in_game/map_data/default.map """
+        return {name: self.locations[name] for name in self.default_map['impassable_mountains']}
+
+    @cached_property
     def institution(self) -> dict[str, Institution]:
         return self.parse_advanced_entities('in_game/common/institution', Institution)
+
+    @cached_property
+    def lakes(self) -> dict[str, Location]:
+        """lake locations from the lakes list in game/in_game/map_data/default.map """
+        return {name: self.locations[name] for name in self.default_map['lakes']}
 
     @cached_property
     def language_families(self) -> dict[str, LanguageFamily]:
@@ -617,8 +662,22 @@ class Eu5Parser(JominiParser):
 
     @cached_property
     def languages(self) -> dict[str, Language]:
-        return self.parse_advanced_entities('in_game/common/languages', Language)
+        languages = self.parse_advanced_entities('in_game/common/languages', Language)
+        for language in languages.values():
+            if language.dialects:
+                language.dialects = self.parse_advanced_entities(language.dialects, Language, allow_empty_entities=True)
+        return languages
 
+    @cached_property
+    def languages_including_dialects(self) -> dict[str, Language]:
+        results = {}
+
+        for language_name, language in self.languages.items():
+            results[language_name] = language
+            if language.dialects:
+                for dialect_name, dialect in language.dialects.items():
+                    results[dialect_name] = dialect
+        return results
 
     @cached_property
     def laws(self) -> dict[str, Law]:
@@ -639,7 +698,14 @@ class Eu5Parser(JominiParser):
     @cached_property
     @disk_cache(game=eu5game, classes_to_cache={Location})
     def locations(self) -> dict[str, Location]:
-        return self.parse_advanced_entities('in_game/map_data/' + self.default_map.get_or_default('location_templates', 'location_templates.txt'), Location)
+        return self.parse_advanced_entities('in_game/map_data/' + self.default_map.get_or_default('location_templates', 'location_templates.txt'), Location, extra_data_functions={
+            'is_earthquakes_zone': lambda name, data: name in self.default_map['earthquakes'],
+            'is_impassable_mountains': lambda name, data: name in self.default_map['impassable_mountains'],
+            'is_lake': lambda name, data: name in self.default_map['lakes'],
+            'is_non_ownable': lambda name, data: name in self.default_map['non_ownable'],
+            'is_sea': lambda name, data: name in self.default_map['sea_zones'],
+            'is_volcano': lambda name, data: name in self.default_map['volcanoes'],
+        })
 
     @cached_property
     def location_ranks(self) -> dict[str, LocationRank]:
@@ -657,6 +723,11 @@ class Eu5Parser(JominiParser):
     @cached_property
     def named_colors(self) -> dict[str, PdxColor]:
         return self._parse_named_colors(['../jomini/loading_screen/common/named_colors', 'main_menu/common/named_colors'])
+
+    @cached_property
+    def non_ownable(self) -> dict[str, Location]:
+        """corridor locations from the non_ownable list in game/in_game/map_data/default.map """
+        return {name: self.locations[name] for name in self.default_map['non_ownable']}
 
     def parse_dlc_from_conditions(self, conditions):
         pass
@@ -757,12 +828,22 @@ class Eu5Parser(JominiParser):
         return ScriptValue(name, name, **entity_data)
 
     @cached_property
+    def sea_zones(self) -> dict[str, Location]:
+        """sea tiles from sea_zones list in game/in_game/map_data/default.map """
+        return {name: self.locations[name] for name in self.default_map['sea_zones']}
+
+    @cached_property
     def topography(self) -> dict[str, Topography]:
         return self.parse_advanced_entities('in_game/common/topography', Topography)
 
     @cached_property
     def vegetation(self) -> dict[str, Vegetation]:
         return self.parse_advanced_entities('in_game/common/vegetation', Vegetation)
+
+    @cached_property
+    def volcanoes(self) -> dict[str, Location]:
+        """volcanoe locations from the volcanoes list in game/in_game/map_data/default.map """
+        return {name: self.locations[name] for name in self.default_map['volcanoes']}
 
     ############################################
     #                                          #
@@ -863,9 +944,24 @@ class Eu5Parser(JominiParser):
                                             # localization_prefix='', localization_suffix='', # Used in 4/4 Examples: {'rank_county': 'County', 'rank_empire': 'Empire'}
                                             description_localization_prefix='', description_localization_suffix='_desc', # Used in 4/4 Examples: {'rank_empire_desc': 'This is the highest [country_rank|e] and represents the most prestigious or powerful [countries|e] in the world.', 'rank_duchy_desc': 'This [country_rank|e] represents a small- to medium-sized [country|e], usually with a single [province|e], but it is larger or more populous than a $rank_county$.'}
                                             )
+
+    def _parse_customizable_localization_text_entry(self, data: Tree | list[Tree]) -> dict[
+        str, CustomizableLocalizationTextEntry]:
+        if not isinstance(data, list):
+            data = [data]
+        return self.parse_advanced_entities(
+            Tree({custom_loc_entry['localization_key']: custom_loc_entry for custom_loc_entry in data}),
+            CustomizableLocalizationTextEntry,
+            extra_data_functions={
+                'display_name': lambda name, data: self.formatter.format_localization_text(self.localize(name))
+            })
+
     @cached_property
     def customizable_localization(self) -> dict[str, CustomizableLocalization]:
-        return self.parse_advanced_entities('in_game/common/customizable_localization', CustomizableLocalization)
+        return self.parse_advanced_entities('in_game/common/customizable_localization', CustomizableLocalization,
+                                            transform_value_functions={
+                                                'text': self._parse_customizable_localization_text_entry,
+                                            })
     @cached_property
     def death_reason(self) -> dict[str, DeathReason]:
         return self.parse_advanced_entities('in_game/common/death_reason', DeathReason, allow_empty_entities=True,
@@ -1168,11 +1264,27 @@ class Eu5Parser(JominiParser):
                                             # localization_prefix='', localization_suffix='_info', # Used in 6/22 Examples: {'hundred_years_war_info': "This is a conflict that will create [wars|e] between [GetCountry('ENG').GetName] and [GetCountry('FRA').GetName] until one side has reached their goals.", 'great_pestilence_info': "[ROOT.GetVariable('great_pestilence_origin').GetLocation.GetName]"}
                                             # localization_prefix='', localization_suffix='_monthly', # Used in 3/22 Examples: {'hundred_years_war_monthly': 'If there is [peace|e] there is a chance of either side restarting the conflict.', 'black_death_monthly': '• This plague will spread to nearby [locations|e], and across trade-routes\\n• It will kill many [pops|E], [armies|e] and [characters|E] where it has spread'}
                                             )
+
+    def _parse_societal_value_one_side(self, side: str, societal_value_name: str, data: Tree) -> SocietalValueOneSide:
+        name = f'{societal_value_name}_{side}'
+        left, _vs, right = societal_value_name.partition('_vs_')
+        if side == 'left':
+            short_name = left
+        else:
+            short_name = right
+        display_name = self.localize(f'{short_name}_focus')
+        modifier = self.parse_modifier_section(societal_value_name, data, f'{side}_modifier', Eu5Modifier)
+        return SocietalValueOneSide(name, display_name, short_name=short_name, modifier=modifier)
+
     @cached_property
     def societal_values(self) -> dict[str, SocietalValue]:
         return self.parse_advanced_entities('in_game/common/societal_values', SocietalValue,
                                             # localization_prefix='', localization_suffix='', # Used in 16/16 Examples: {'traditionalist_vs_innovative': 'Traditionalist vs Innovative', 'spiritualist_vs_humanist': 'Spiritualist vs Humanist'}
                                             description_localization_prefix='', description_localization_suffix='_desc', # Used in 16/16 Examples: {'capital_economy_vs_traditional_economy_desc': 'A [country|e] with a capital economy is more focused on earning money, particularly from [trade|e] and [towns_and_cities|e], while one with a traditional economy is more oriented about living off what the land provides.', 'serfdom_vs_free_subjects_desc': 'A country with high serfdom is about exploiting the peasants as much as possible, whereas a country with free subjects treats peasants as human beings.'}
+                                            extra_data_functions= {
+                                                'left': lambda name, data: self._parse_societal_value_one_side('left', name, data),
+                                                'right': lambda name, data: self._parse_societal_value_one_side('right', name, data),
+                                            }
                                             )
     @cached_property
     def subject_military_stances(self) -> dict[str, SubjectMilitaryStance]:
