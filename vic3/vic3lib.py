@@ -20,8 +20,9 @@ class Vic3AdvancedEntity(AdvancedEntity):
 
 class Vic3ModifierType(ModifierType):
 
-    def _get_fully_localized_display_name_and_desc(self) -> (str, str):
-        display_name, description = super()._get_fully_localized_display_name_and_desc()
+    @cached_property
+    def display_name(self) -> str:
+        display_name = super().display_name
         if display_name == self.name:
             # modifiers which are named like state_catholic_standard_of_living_add
             match = re.fullmatch(r'state_([^ ]*)_standard_of_living_add', self.name)
@@ -29,9 +30,17 @@ class Vic3ModifierType(ModifierType):
                 pop = match.group(1)
                 pop_loc = self.parser.localize(pop)
                 display_name = f'Standard of Living for {pop_loc} Pops'
-                if description == self.name + '_desc':
-                    description = self.parser.localize('state_standard_of_living_add_desc')
-        return display_name, description
+        return display_name
+
+    @cached_property
+    def description(self) -> str:
+        description = super().description
+        if description == self.name + '_desc':
+            # modifiers which are named like state_catholic_standard_of_living_add
+            match = re.fullmatch(r'state_([^ ]*)_standard_of_living_add', self.name)
+            if match:
+                description = self.parser.localize('state_standard_of_living_add_desc')
+        return description
 
 
 class NamedModifier(Vic3AdvancedEntity):
@@ -256,6 +265,8 @@ class BuildingGroup(NameableEntity):
     has_trade_revenue: bool = False
     company_headquarter: bool = False
     regional_company_headquarter: bool = False
+    self_investment_chance_modifier: bool = False
+    builds_ships: bool = False
 
     def __init__(self, name: str, display_name: str, parent_group: 'BuildingGroup' = None, **kwargs):
         super().__init__(name, display_name)
@@ -289,7 +300,10 @@ class Building(Vic3AdvancedEntity):
         return self.get_wiki_file_tag()
 
     def get_wiki_page_name(self) -> str:
-        return 'List of buildings'
+        if self.unique:
+            return 'Unique building'
+        else:
+            return 'List of buildings'
 
     @cached_property
     def production_methods(self) -> list['ProductionMethod']:
@@ -457,10 +471,13 @@ class Achievement(Vic3AdvancedEntity):
     possible: Tree
     happened: Tree
 
+    def get_wiki_page_name(self) -> str:
+        return 'Achievements'
+
 
 class Character(NameableEntity):
-    first_name: str
-    last_name: str
+    first_name: str = ''
+    last_name: str = ''
     country: Country = None
     female: bool = False
     culture: str = ''
@@ -506,8 +523,9 @@ class Character(NameableEntity):
             'Ruler': self.ruler,
             'Heir': self.heir,
             'Politician': self.ig_leader or self.interest_group_leader_usage,
-            'General': self.is_general or (self.commander_usage and self.commander_usage['role'] == 'general'),
-            'Admiral': self.is_admiral or (self.commander_usage and self.commander_usage['role'] == 'admiral'),
+            'Undefined commander role(possible bug?)': self.commander_usage and ('role' not  in self.commander_usage or self.commander_usage['role'] not in ('general', 'admiral')),
+            'General': self.is_general or (self.commander_usage and 'role' in self.commander_usage and self.commander_usage['role'] == 'general'),
+            'Admiral': self.is_admiral or (self.commander_usage and 'role' in self.commander_usage and self.commander_usage['role'] == 'admiral'),
             'Agitator': self.is_agitator or self.agitator_usage,
         }.items() if has_role]
 

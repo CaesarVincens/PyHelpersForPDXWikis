@@ -1,3 +1,7 @@
+import json
+from functools import cached_property
+
+from PyHelpersForPDXWikis.localsettings import STELLARISDIR, CK3DIR
 from aow4.game import aow4game
 from common.paradox_lib import Game
 from cs2.game import cs2game
@@ -158,7 +162,17 @@ class CitiesSkylines(Game):
     name = 'Cities: Skylines'
     short_game_name = 'skylines'
     wiki_domain = 'skylines.paradoxwikis.com'
+    game_path = eu4dir / '../Cities_Skylines'
+    launcher_settings = game_path / 'launcher-settings.json'
 
+    @cached_property
+    def version(self):
+        return self.full_version.partition('-')[0]
+
+    @cached_property
+    def full_version(self) -> str:
+        json_object = json.load(open(self.launcher_settings, encoding='utf-8'))
+        return json_object['version']
 
 skylinesgame = CitiesSkylines()
 
@@ -169,6 +183,8 @@ class CrusaderKings3(Game):
     name = 'Crusader Kings 3'
     short_game_name = 'ck3'
     wiki_domain = 'ck3.paradoxwikis.com'
+    game_path = CK3DIR
+    launcher_settings = game_path / 'launcher/launcher-settings.json'
 
 
 ck3game = CrusaderKings3()
@@ -178,6 +194,7 @@ class HeartsofIron4(Game):
     """Never construct this object manually. Use the variable hoi4game instead.
     This way all data can be cached without having to pass on references to the game or the parser"""
     name = 'Hearts of Iron 4'
+    alternative_name = 'Hearts of Iron IV'
     short_game_name = 'hoi4'
     wiki_domain = 'hoi4.paradoxwikis.com'
     game_path = eu4dir / '../Hearts of Iron IV'
@@ -215,6 +232,8 @@ class Stellaris(Game):
     name = 'Stellaris'
     short_game_name = 'stellaris'
     wiki_domain = 'stellaris.paradoxwikis.com'
+    game_path = STELLARISDIR
+    launcher_settings = game_path / 'launcher-settings.json'
 
 
 stellarisgame = Stellaris()
