@@ -1,16 +1,22 @@
 import copy
+import hashlib
+import os
+import pprint
 import uuid
-from collections.abc import MutableMapping
+from collections.abc import MutableMapping, Iterable
 from functools import reduce
+from operator import attrgetter
 from typing import Callable, Type
 
 from PyHelpersForPDXWikis.localsettings import EU5DIR
 from common.cache import disk_cache
 from common.file_generator import FileGenerator
+from common.wiki_image import WikiImage, WikiImageFile, WikiImageFileReference
 from eu5.eu5lib import *
 from common.jomini_parser import JominiParser
 from common.paradox_lib import NE, AE, ME
-from common.paradox_parser import ParsingWorkaround
+from common.paradox_parser import ParsingWorkaround, ScriptedWorkaround, TreeWithDuplicates
+from eu5.localization import Eu5Localizer
 
 
 class Eu5Parser(JominiParser):
@@ -20,22 +26,21 @@ class Eu5Parser(JominiParser):
         Language: 'languages_including_dialects',
     }
 
-    # allows the overriding of localization strings
-    localizationOverrides = {
-        # the default is "Trade Embark/Disembark Cost" which is problematic for redirects and filenames, because of the slash
-        'MODIFIER_TYPE_NAME_local_trade_embark_disembark_cost_modifier': 'Trade Embark-Disembark Cost',
-        'BGP': 'Burgundy (BGP)',
-        'MAM': 'Egypt (MAM)'
-    }
+    _all_production_methods: dict[str, ProductionMethod] = None
+
+    localizer: Eu5Localizer
 
     def __init__(self, game_installation: Path = EU5DIR, language: str = 'english'):
         super().__init__(game_installation / 'game' )
-        self.localization_folder_iterator = (game_installation / 'game' / 'main_menu' / 'localization' / language).glob(f'**/*_l_{language}.yml')
+        self.localizer = Eu5Localizer(game_installation, language)
 
     @cached_property
     def formatter(self):
         from eu5.text_formatter import Eu5WikiTextFormatter
         return Eu5WikiTextFormatter()
+
+    def localize_and_format(self, key):
+        return self.formatter.format_localization_text(self.localize(key))
 
     def parse_nameable_entities(self, folder: str, entity_class: Type[NE], extra_data_functions: dict[str, Callable[[str, Tree], Any]] = None,
                                 transform_value_functions: dict[str, Callable[[Any], Any]] = None, entity_level: int = 0,
@@ -52,7 +57,7 @@ class Eu5Parser(JominiParser):
         return super().parse_nameable_entities(folder, entity_class, extra_data_functions, transform_value_functions, entity_level, level_headings_keys,
                                                parsing_workarounds, localization_prefix, allow_empty_entities, localization_suffix)
 
-    def parse_advanced_entities(self, folder: str, entity_class: Type[AE], extra_data_functions: dict[str, Callable[[str, Tree], Any]] = None,
+    def parse_advanced_entities(self, folder: str|Tree, entity_class: Type[AE], extra_data_functions: dict[str, Callable[[str, Tree], Any]] = None,
                                 transform_value_functions: dict[str, Callable[[Any], Any]] = None, localization_prefix: str = '', allow_empty_entities=False,
                                 parsing_workarounds: list[ParsingWorkaround] = None,
                                 description_localization_prefix: str = None,
@@ -61,11 +66,13 @@ class Eu5Parser(JominiParser):
                                 ) -> dict[str, AE]:
         if extra_data_functions is None:
             extra_data_functions = {}
-        if 'description' not in extra_data_functions:
+        if '_unformatted_description' not in extra_data_functions and 'description' not in extra_data_functions:
             if description_localization_prefix is None:
                 description_localization_prefix = localization_prefix
-            extra_data_functions['description'] = lambda name, data: self.formatter.format_localization_text(self.localize(description_localization_prefix + name + description_localization_suffix, default=''))
-        return super().parse_advanced_entities(folder, entity_class, extra_data_functions, transform_value_functions, localization_prefix, allow_empty_entities, parsing_workarounds, localization_suffix)
+            extra_data_functions['_unformatted_description'] = lambda name, data: self.localize(f'{description_localization_prefix}{name}{description_localization_suffix}', default='')
+        if '_formatter' not in extra_data_functions:
+            extra_data_functions['_formatter'] = lambda name, data: self.formatter
+        return self.parse_nameable_entities(folder, entity_class, extra_data_functions, transform_value_functions, localization_prefix=localization_prefix, allow_empty_entities=allow_empty_entities, parsing_workarounds=parsing_workarounds, localization_suffix=localization_suffix)
 
     @cached_property
     def modifier_icons(self) -> Tree:
@@ -91,20 +98,24 @@ class Eu5Parser(JominiParser):
 
     @cached_property
     def named_modifiers(self) -> dict[str, Eu5NamedModifier]:
-        return self.parse_nameable_entities('main_menu/common/static_modifiers', Eu5NamedModifier,
+        return self.parse_advanced_entities('main_menu/common/static_modifiers', Eu5NamedModifier,
                                             localization_prefix='STATIC_MODIFIER_NAME_',
+                                            description_localization_prefix='STATIC_MODIFIER_DESC_',
+                                            description_localization_suffix='',
                                             extra_data_functions={
                                                 'modifier': lambda name, data: self._parse_modifier_data(
                                                     Tree({name: value for name, value in data if name not in ['category', 'decaying', 'game_data']}),
                                                     modifier_class=Eu5Modifier),
                                                 'category': lambda name, data: data['game_data']['category'],
                                                 'decaying': lambda name, data: data['game_data']['decaying'] if 'decaying' in data['game_data'] else False,
-                                                'description': lambda name, data: self.formatter.format_localization_text(self.localize('STATIC_MODIFIER_DESC_' + name, default='')),
                                             })
 
-    def _parse_modifier_data(self, data: Tree, modifier_class: Type[ME] = Modifier) -> list[ME]:
+    def _parse_modifier_data(self, data: Tree,
+                             modifier_class: Type[ME] = Eu5Modifier,
+                             excludes: Iterable[str] = ('potential_trigger', 'scale', 'pure_tooltip_entry', 'content_priority')
+                             ) -> list[ME]:
         """@TODO: parse potential_trigger and scale and pure_tooltip_entry"""
-        return super()._parse_modifier_data(Tree({mod_name: mod_value for mod_name, mod_value in data if mod_name not in ['potential_trigger', 'scale', 'pure_tooltip_entry']}), modifier_class)
+        return super()._parse_modifier_data(data, modifier_class, excludes)
 
     def parse_modifier_section_from_wiki_section_name(self, wiki_section_name: str) -> list[Eu5Modifier]:
         """
@@ -166,16 +177,27 @@ class Eu5Parser(JominiParser):
         return self.parse_advanced_entities('in_game/common/advances', Advance,
                                             extra_data_functions={
                                                 'age_specialization': lambda name, data: data['for'] if 'for' in data else None,
+                                                'modifiers': lambda name, data: self._parse_modifier_data(
+                                                    data,
+                                                    excludes=list(Advance.all_annotations().keys()) + ['requires', 'in_tree_of', 'for', 'content_priority', 'pure_tooltip_entry']),
                                             },
                                             transform_value_functions={
                                                 # so that the parser passes the value through even though requires is not an attribute
                                                 'requires': lambda c: c,
+                                                'in_tree_of': lambda c: c,
+                                                'unlock_production_method': lambda pm_strings: [
+                                                    self.all_production_methods[pm]
+                                                    for pm in (
+                                                        pm_strings if not isinstance(pm_strings, str)
+                                                        else [pm_strings])],
                                             },
                                             )
 
     @cached_property
     def age(self) -> dict[str, Age]:
-        return self.parse_advanced_entities('in_game/common/age', Age)
+        return self.parse_advanced_entities('in_game/common/age', Age, extra_data_functions={
+            'long_name': lambda name, data: self.formatter.strip_formatting(self.localize(f'age_format_{name}'))
+        })
 
     @cached_property
     def building_category(self) -> dict[str, BuildingCategory]:
@@ -192,8 +214,8 @@ class Eu5Parser(JominiParser):
                                                 'obsolete': lambda value: [value] if isinstance(value, str) else value,
                                                 'price': lambda value: self.prices[value] if isinstance(value, str) else value,
                                                 'pop_size_created': lambda value: (self.script_values[value] if isinstance(value, str) else value) * 1000,
-                                                'possible_production_methods': lambda value: [self.production_methods[pm] if isinstance(pm, str) else pm for pm in value],
-                                                'unique_production_methods': lambda value: [list(self._parse_production_methods(tree).values()) for tree in (value if isinstance(value, list) else [value])],
+                                                'possible_production_methods': lambda value: [self.all_production_methods[pm] if isinstance(pm, str) else pm for pm in value],
+                                                'unique_production_methods': lambda value: [list(self._parse_production_methods(tree, add_to_all_production_methods=True).values()) for tree in (value if isinstance(value, list) else [value])],
                                             })
         # replace str references in obsolete by references to the building objects
         for building in list(buildings.values()):
@@ -309,7 +331,7 @@ class Eu5Parser(JominiParser):
         return self._map_entities[4]
 
     @cached_property
-    def _tag_specific_descriptions(self) -> dict[str, str]:
+    def tag_specific_descriptions(self) -> dict[str, str]:
         tag_to_description = {}
         for custom_loc in self.customizable_localization['country_history'].text.values():
             if not custom_loc.fallback:
@@ -339,7 +361,7 @@ class Eu5Parser(JominiParser):
         country_data: Tree
         for tag, country_data in countries_from_ingame_setup:
             if tag in self.setup_data['countries']['countries']:
-               country_data.update(self.setup_data['countries']['countries'][tag])
+                country_data.update(self.setup_data['countries']['countries'][tag])
 
         return self.parse_advanced_entities(countries_from_ingame_setup, Country,
                                             transform_value_functions={
@@ -354,7 +376,6 @@ class Eu5Parser(JominiParser):
                                                 # the default rank seems to be county. Pass it as extra data, so that it is set
                                                 # in the object instead of in the class, so that it gets cached correctly
                                                 'default_rank': lambda name, data: self.country_ranks['rank_county'],
-                                                'description': lambda name, data: self._tag_specific_descriptions.get(name, ''),
                                             }
         )
 
@@ -378,14 +399,17 @@ class Eu5Parser(JominiParser):
         for filename, template in template_data_without_include.items():
             template_data[filename] = self._resolve_includes(template, template_data, template_data_without_include)
 
-        return self._resolve_includes(self._fix_law_values(self.parser.parse_folder_as_one_file('main_menu/setup/start/')),
-                                      template_data,
-                                      other_templates={},
-                                      recursive=True
-                                      )
+        return self._resolve_includes(self._fix_law_values(self.parser.parse_folder_as_one_file(
+            'main_menu/setup/start/',
+            overwrite_duplicate_keys_at_level=None
+        )),
+            template_data,
+            other_templates={},
+            recursive=True
+        )
 
     def _fix_law_value(self, law_value):
-        if isinstance(law_value, list):
+        if isinstance(law_value, list) and (len(law_value) == 0 or not isinstance(law_value[0], str)):
             law_value = Tree({law_key: law_value
                               for law_tree in law_value
                               for law_key, law_value in law_tree})
@@ -406,8 +430,8 @@ class Eu5Parser(JominiParser):
 
     def _resolve_includes(self, data: Tree, templates, other_templates, recursive=False):
         if 'include' in data or recursive:
-            new_template = Tree({})
-            for key, value in data:
+            new_template = TreeWithDuplicates({}, [])
+            for key, value in data.iterate_with_duplicates():
                 if key == 'include':
                     if not isinstance(value, list):
                         value = [value]
@@ -416,7 +440,8 @@ class Eu5Parser(JominiParser):
                             included_data = templates[include_file]
                         else:
                             included_data = other_templates[include_file]
-                        new_template.update(copy.deepcopy(included_data))
+                        deepcopy = copy.deepcopy(included_data)
+                        new_template.update(deepcopy)
                 elif key in new_template:
                     if isinstance(value, Tree) or isinstance(value, MutableMapping):
                         new_template[key].update(value)
@@ -430,9 +455,12 @@ class Eu5Parser(JominiParser):
                         pass
                     else:
                         new_template[key] = value
+
                 else:
                     if key in ['laws', 'government']:
                         value = self._fix_law_value(value)
+                    elif key == 'dynasty' and not isinstance(value, list):
+                        value = [value]
                     if isinstance(value, Tree):
                         new_template[key] = self._resolve_includes(value, templates, other_templates, recursive)
                     else:
@@ -461,21 +489,195 @@ class Eu5Parser(JominiParser):
 
     @cached_property
     def defines(self):
-        # TODO: add defines from jomini folder
         class DoubleSlashCommentWorkaround(ParsingWorkaround):
             """removes lines which start with spaces and //
             they are not valid paradox script and cause a debug message when loading, but the defines have them
             """
             replacement_regexes = {r'(?m)^\s*//.*$': ''}
 
-        return self.parser.parse_folder_as_one_file('loading_screen/common/defines', workarounds=[DoubleSlashCommentWorkaround()]).merge_duplicate_keys()
+        jomini_defines = self.parser.parse_folder_as_one_file('../jomini/*/common/defines',
+                                                    workarounds=[DoubleSlashCommentWorkaround()],
+                                                    overwrite_duplicate_keys_at_level=1,
+                                                    ).merge_duplicate_keys()
+        return jomini_defines.update(self.parser.parse_folder_as_one_file('*/common/defines',
+                                                    workarounds=[DoubleSlashCommentWorkaround()],
+                                                    overwrite_duplicate_keys_at_level=1,
+                                                    ).merge_duplicate_keys(), overwrite_duplicate_keys_at_level=1)
 
+    @cached_property
+    def define_commments(self):
+        class LongCommentHandling(ParsingWorkaround):
+            "Replace // with # so they are considered regular comments"
+            replacement_regexes = {r'(?m)^(\s*)[/#]+\s+(.*)$': r'LONG_COMMENT = 0 # \2'}
+        class EscapeQuotes(ParsingWorkaround):
+            "Escape quotes and \\ for Lua use"
+            replacement_regexes = {r'(?m)([\"\\])': r'\\\1'}
+        class FormatComments(ParsingWorkaround):
+            "Replace define values with their comments, if any"
+            replacement_regexes = {r'(?m)^\t(\w+)\s+=\s+0\s*#(.+)$': r'\t\1 = "\2"'}
+        class RemoveValues(ParsingWorkaround):
+            "Remove define values"
+            replacement_regexes = {r'(?m)\s+=\s+[/@\w\.;-]+(#.+)?$': r' = 0\1'}
+        class RemoveVals2(ParsingWorkaround):
+            "Remove define values"
+            replacement_regexes = {r'(?m)\s+=\s+{.+}$': r' = 0'}
+        class StripQuoteValues(ParsingWorkaround):
+            "remove quotes from values"
+            replacement_regexes = {r'(?m)=\s+"[^#]+"': r'= 0'}
+        class HandleBlocks(ParsingWorkaround):
+            replacement_regexes = {r'(?m)\t\t+[^#}]+$': ''}
+        class HandleBlocks2(ParsingWorkaround):
+            replacement_regexes = {r'(?m)\t\t+"lf\w{3}=\{.+$': ''}
+        #workaroundList = [HandleBlocks(),HandleBlocks2(),StripQuoteValues(),EscapeQuotes(),RemoveVals2(),RemoveValues(),LongCommentHandling(),FormatComments()]
+        workaroundList = [EscapeQuotes(),RemoveValues(),LongCommentHandling(),FormatComments()]
+        return self.parser.parse_folder_as_one_file('loading_screen/common/defines', workarounds=workaroundList).merge_duplicate_keys()
+    
     def get_define(self, define: str):
         """get a define by its game syntax e.g. NGame.START_DATE"""
         result = self.defines
         for part in define.split('.'):
             result = result[part]
         return result
+
+    @cached_property
+    def dlcs(self) -> dict[str, DLC]:
+        dlc_data = {}
+        for file in (self.parser.base_folder / 'dlc').glob('*/*.json'):
+            if 'D000_shared' in str(file):
+                continue
+            json_contents = self.parser.json_to_tree(file.read_text(encoding='utf-8-sig'))
+            name = json_contents['name']
+            del json_contents['name']
+            json_contents['path'] = file.parent
+            dlc_data[name] = json_contents
+
+        return self.parse_advanced_entities(
+            Tree(dlc_data),
+            DLC,
+            extra_data_functions={
+                'display_name': lambda _name, data: self.formatter.strip_formatting(self.localize(data['localizable_name'])).replace("'", "")
+            }
+        )
+
+    @cached_property
+    def dlcs_including_base_game(self) -> dict[str, DLC]:
+        base_game = BaseGame(self.parser.base_folder)
+        dlcs = { base_game.name: base_game }
+        dlcs.update(self.dlcs)
+        return dlcs
+
+    @cached_property
+    def dynasties(self) -> dict[str, Dynasty]:
+        """Only scripted dynasties from setup, but not from the dynasty names"""
+        return self.parse_advanced_entities(self.setup_data['dynasty_manager'], Dynasty, extra_data_functions={
+                                            'display_name': lambda entity_name, entity_data: self.formatter.strip_formatting(
+                                                self.localize(entity_data['name']['name']),
+                                                strip_newlines=True)
+                                            })
+
+    @cached_property
+    def dynasty_names(self) -> dict[str, Dynasty|Language]:
+        """Includes dynasty names from setup (with their Dynasty)
+         and from the languages and dialects(with their Language)"""
+        names = {dynasty_name: language
+                 for language in self.languages_including_dialects.values()
+                 for dynasty_name in language.dynasty_names}
+        names.update(self.dynasties)
+        return names
+
+    @cached_property
+    def diplomacy_relationships(self) -> dict[str, dict]:
+        """Parse diplomacy.txt and international_organizations.txt to extract subject/overlord relationships and IO memberships
+        
+        Returns a dict with structure:
+        {
+            'overlords': {'subject_tag': 'overlord_tag', ...},  # maps each subject to their overlord
+            'subject_types': {'subject_tag': 'subject_type', ...},  # maps each subject to their subject type (vassal, tributary, etc)
+            'io_members': {'member_tag': ['io_name1', 'io_name2'], ...},  # maps countries to list of international organizations
+        }
+        """
+        relationships = {
+            'overlords': {},
+            'subject_types': {},
+            'io_members': {},
+            # Maps member tag -> {io_type: [law_keys]}
+            'io_member_laws': {},
+        }
+        
+        try:
+            diplomacy_data = self.parser.parse_file('main_menu/setup/start/12_diplomacy.txt')
+            
+            # Extract dependency relationships (subject/overlord)
+            if 'diplomacy_manager' in diplomacy_data:
+                diplomacy_manager = diplomacy_data['diplomacy_manager']
+                for key, value in diplomacy_manager:
+                    if key == 'dependency':
+                        # Handle both single dependency and list of dependencies
+                        dependencies = value if isinstance(value, list) else [value]
+                        for dependency in dependencies:
+                            if isinstance(dependency, Tree):
+                                if 'first' in dependency and 'second' in dependency:
+                                    overlord = dependency['first']
+                                    subject = dependency['second']
+                                    subject_type = dependency.get('subject_type', 'unknown')
+                                    
+                                    relationships['overlords'][subject] = overlord
+                                    relationships['subject_types'][subject] = subject_type
+                    elif key == 'international_organization_membership' or key == 'member_of':
+                        # Handle IO memberships from diplomacy file
+                        memberships = value if isinstance(value, list) else [value]
+                        for membership in memberships:
+                            if isinstance(membership, Tree):
+                                if 'member' in membership and 'organization' in membership:
+                                    member = membership['member']
+                                    org = membership['organization']
+                                    if member not in relationships['io_members']:
+                                        relationships['io_members'][member] = []
+                                    relationships['io_members'][member].append(org)
+        except Exception as e:
+            print(f'Warning: Could not parse diplomacy relationships: {e}')
+        
+        # Parse international organizations file for member lists
+        try:
+            io_data = self.parser.parse_file('main_menu/setup/start/15_international_organizations.txt')
+            if 'international_organization_manager' in io_data:
+                io_manager = io_data['international_organization_manager']
+                for key, value in io_manager:
+                    if key == 'add_international_organization':
+                        # Handle both single IO and list of IOs
+                        ios = value if isinstance(value, list) else [value]
+                        for io_entry in ios:
+                            if isinstance(io_entry, Tree) and 'type' in io_entry and 'members' in io_entry:
+                                io_type = io_entry['type']
+                                members = io_entry['members']
+                                # Members could be a single list or multiple entries
+                                if isinstance(members, list) and len(members) > 0 and not isinstance(members[0], str):
+                                    # List of lists - flatten them
+                                    member_tags = [tag for sublist in members for tag in (sublist if isinstance(sublist, list) else [sublist])]
+                                else:
+                                    member_tags = members if isinstance(members, list) else [members]
+                                
+                                for member_tag in member_tags:
+                                    if member_tag not in relationships['io_members']:
+                                        relationships['io_members'][member_tag] = []
+                                    if io_type not in relationships['io_members'][member_tag]:
+                                        relationships['io_members'][member_tag].append(io_type)
+
+                                    # Capture per-member law selections (used by Hindu Branch)
+                                    law_values = io_entry.get('laws', [])
+                                    if isinstance(law_values, Tree):
+                                        law_values = [value for _, value in law_values]
+                                    if not isinstance(law_values, list):
+                                        law_values = [law_values]
+                                    law_values = [lv for lv in law_values if lv is not None]
+
+                                    if law_values:
+                                        member_law_map = relationships['io_member_laws'].setdefault(member_tag, {})
+                                        member_law_map[io_type] = law_values
+        except Exception as e:
+            print(f'Warning: Could not parse international organization memberships: {e}')
+        
+        return relationships
 
     @cached_property
     def earthquakes(self) -> dict[str, Location]:
@@ -491,9 +693,137 @@ class Eu5Parser(JominiParser):
         return self.parse_advanced_entities('in_game/common/estate_privileges', EstatePrivilege)
 
     @cached_property
+    def events(self) -> dict[str, Event]:
+        return {event_id: event for event_file in self.event_files.values() for event_id, event in event_file.events.items()}
+
+    @cached_property
+    def event_files(self) -> dict[str, EventFile]:
+        event_option_attributes = set(EventOption.all_annotations().keys())
+        event_option_attributes.add('name')
+        event_files = {}
+        for path, filedata in self.parser.parse_files('in_game/events/**/*.txt', [ScriptedWorkaround()]):
+            filename = str(path.relative_to(self.parser.base_folder / 'in_game/events' ))
+            namespaces = []
+            scripted_triggers = {}
+            scripted_effects = {}
+            unparsed_events = Tree({})
+            for k, v in filedata:
+                if k == 'namespace':
+                    if isinstance(v, list):
+                        namespaces.extend(v)
+                    else:
+                        namespaces.append(v)
+                elif k == 'scripted_trigger':
+                    scripted_triggers.update(self.parse_advanced_entities(
+                        Tree({
+                            trigger_data['id']: trigger_data
+                            for trigger_data in (
+                                v if isinstance(v, list) else [v]
+                            )
+                        }),
+                        ScriptedTrigger
+                    ))
+                elif k == 'scripted_effect':
+                    scripted_effects.update(self.parse_advanced_entities(
+                        Tree({
+                            effect_data['id']: effect_data
+                            for effect_data in (
+                                v if isinstance(v, list) else [v]
+                            )
+                        }),
+                        ScriptedEffect
+                    ))
+                elif '.' in k and k.partition('.')[0] in namespaces:
+                    unparsed_events[k] = v
+                else:
+                    raise Exception(f'Unexpected key {k} when parsing event file {filename}')
+
+            events = self.parse_advanced_entities(unparsed_events, Event,
+                                            transform_value_functions={
+                                                'historical_info': self.localize_and_format,
+                                                'option': lambda option: self.parse_advanced_entities(
+                                                    Tree({
+                                                        option_data['name']: option_data
+                                                        for option_data in (
+                                                            option if isinstance(option, list) else [option]
+                                                        )
+                                                    }),
+                                                    EventOption,
+                                                    extra_data_functions={
+                                                        'effect': lambda name, data: Tree({
+                                                            option_key: option_value
+                                                            for option_key, option_value in data
+                                                            if option_key not in event_option_attributes
+                                                        })
+                                                    }
+                                                )
+                                            })
+            if len(events) > 0:
+                event_file = EventFile(path=path, filename=filename, namespaces=namespaces,
+                                       scripted_triggers=scripted_triggers, scripted_effects=scripted_effects,
+                                       events=events)
+                for event in events.values():
+                    event.event_file = event_file
+                event_files[filename] = event_file
+            elif 'readme' not in filename.lower():
+                print(f'Error: no events in "{filename}"')
+
+
+        return event_files
+
+    @cached_property
+    def flag_definitions(self) -> dict[str, FlagDefinitionList]:
+        """Includes dummy flag definitions for countries which use the coa which has the same name as their tag"""
+        result = {}
+        for tag, flag_definitions_data in self.parser.parse_folder_as_one_file('main_menu/common/flag_definitions').merge_duplicate_keys():
+            if tag == 'DEFAULT':
+                continue  # default is special and would need different handling
+            flag_definitions = flag_definitions_data['flag_definition']
+            if isinstance(flag_definitions, Tree):
+                flag_definitions = [flag_definitions]
+            result[tag] = FlagDefinitionList(
+                tag=tag,
+                parser=self,
+                flag_definitions=list(
+                    self.parse_advanced_entities(
+                        Tree({
+                            f'{tag}_flag_definition_{i}': flag_def
+                            for i, flag_def in enumerate(flag_definitions)
+                        }),
+                        FlagDefinition,
+                        extra_data_functions={
+                            'tag': lambda _name, _data: tag
+                        }
+                    ).values()
+                )
+            )
+        tags_with_coas_without_flag_def = (set(self.countries_including_formables.keys()) & set(
+            self.coat_of_arms.keys())) - set(result.keys())
+        for tag in tags_with_coas_without_flag_def:
+            result[tag] = FlagDefinitionList(
+                tag=tag,
+                parser=self,
+                flag_definitions=[
+                    FlagDefinition(
+                        f'{tag}_dummy_flag_definition',
+                        f'{tag}_dummy_flag_definition',
+                        coa=self.coat_of_arms[tag],
+                        priority=1,
+                        dummy=True,
+                    ),
+                ]
+            )
+        return result
+
+    @cached_property
     def game_concepts(self) -> dict[str, Eu5GameConcept]:
         """Includes the aliases as well"""
-        concepts = self.parse_advanced_entities('main_menu/common/game_concepts', Eu5GameConcept, localization_prefix='game_concept_', allow_empty_entities=True)
+        concepts = self.parse_advanced_entities('main_menu/common/game_concepts', Eu5GameConcept,
+                                                localization_prefix='game_concept_',
+                                                allow_empty_entities=True,
+                                                extra_data_functions={
+                                                    'description': lambda name, data: self.localize('game_concept_' + name + '_desc', default='')
+                                                })
         for name in list(concepts.keys()):  # iterate over a new list so that we can add to the concepts variable during the iteration
             concept = concepts[name]
             aliases = []
@@ -554,7 +884,10 @@ class Eu5Parser(JominiParser):
             results[language_name] = language
             if language.dialects:
                 for dialect_name, dialect in language.dialects.items():
-                    results[dialect_name] = dialect
+                    if dialect_name in results:
+                        print(f'Error {dialect_name} already defined {results[dialect_name]}')
+                    else:
+                        results[dialect_name] = dialect
         return results
 
     @cached_property
@@ -634,23 +967,40 @@ class Eu5Parser(JominiParser):
 
     @cached_property
     def production_methods(self) -> dict[str, ProductionMethod]:
-        return self._parse_production_methods('in_game/common/production_methods')
+        return self._parse_production_methods('in_game/common/production_methods', add_to_all_production_methods=False)
 
-    def _parse_production_methods(self, data_source: str | Tree):
+    @property
+    def all_production_methods(self) -> dict[str, ProductionMethod]:
+        """Also includes unique production methods which are defined in buildings"""
+        if self._all_production_methods is None:
+            self._all_production_methods = self.production_methods.copy()
+        return self._all_production_methods
+
+    def _parse_production_methods(self, data_source: str | Tree, add_to_all_production_methods: bool) -> dict[str, ProductionMethod]:
         if isinstance(data_source, list):
             FileGenerator.warn(f'Multiple production method sections:{[[name for name, data in tree] for tree in data_source]}')
             data_source = reduce(lambda t1, t2: t1.update(t2), data_source)
-        return self.parse_nameable_entities(data_source, ProductionMethod,
+        pms = self.parse_nameable_entities(data_source, ProductionMethod,
                                             extra_data_functions={
                                                 'input': lambda name, data: [Cost.create_with_goods(key, value) for key, value in data if key in self.goods],
                                             },
                                             transform_value_functions={
                                                 'produced': lambda value: self.goods[value]
                                             })
+        if add_to_all_production_methods:
+            self.all_production_methods.update(pms)
+
+        return pms
 
     @cached_property
     def religious_aspects(self) -> dict[str, ReligiousAspect]:
-        return self.parse_advanced_entities('in_game/common/religious_aspects', ReligiousAspect)
+        aspects = self.parse_advanced_entities('in_game/common/religious_aspects', ReligiousAspect)
+        for aspect in aspects.values():
+            if aspect.opinions:
+                aspect.opinions = {aspects[key]: value for key, value in aspect.opinions}
+            else:
+                aspect.opinions =  {}
+        return aspects
 
     @cached_property
     def religious_factions(self) -> dict[str, ReligiousFaction]:
@@ -735,7 +1085,7 @@ class Eu5Parser(JominiParser):
         return self.parse_advanced_entities('main_menu/common/coat_of_arms/coat_of_arms', CoatOfArms)
     @cached_property
     def achievements(self) -> dict[str, Achievement]:
-        return self.parse_advanced_entities('in_game/common/achievements', Achievement,
+        return self.parse_advanced_entities('main_menu/common/achievements', Achievement,
                                             description_localization_prefix='ACHIEVEMENT_DESC_', description_localization_suffix='', # Used in 1/1 Examples: {'ACHIEVEMENT_DESC_until_death_do_us_apart': 'Secure a Royal Marriage with another country.'}
                                             localization_prefix='ACHIEVEMENT_', # Used in 1/1 Examples: {'ACHIEVEMENT_until_death_do_us_apart': 'Until death do us apart'}
                                             )
@@ -806,6 +1156,16 @@ class Eu5Parser(JominiParser):
         return self.parse_advanced_entities('in_game/common/child_educations', ChildEducation,
                                             # localization_prefix='', localization_suffix='', # Used in 5/5 Examples: {'administrative_education': 'Administrative Education', 'military_education': 'Military Education'}
                                             description_localization_prefix='', description_localization_suffix='_desc', # Used in 5/5 Examples: {'expensive_in_depth_education_desc': 'Our wealth is sufficient when it comes to securing in-depth education for our heir. Access to some of the best tutors and material source will grant us unique knowledge as well as the best education money can buy.', 'military_education_desc': 'Projecting military strength is the backbone of our nation. A focus on military matters and the study of the nature of war as well as management of our armed forces are pivotal for educational purposes.'}
+                                            )
+    @cached_property
+    def chivalric_orders(self) -> dict[str, ChivalricOrder]:
+        return self.parse_advanced_entities('in_game/common/chivalric_orders', ChivalricOrder,
+                                            # localization_prefix='', localization_suffix='', # Used in 15/15 Examples: {'order_of_the_white_eagle': 'Order of the White Eagle', 'order_of_the_swan': 'Order of the Swan'}
+                                            description_localization_prefix='', description_localization_suffix='_desc', # Used in 15/15 Examples: {'society_elephant_tyrol_desc': '$noble_society_tyrol_desc$', 'society_with_the_donkey_desc': '$noble_society_baden_palatine_desc$'}
+                                            # localization_prefix='STATIC_MODIFIER_EFFECT_joined_', localization_suffix='', # Used in 13/15 Examples: {'STATIC_MODIFIER_EFFECT_joined_society_elephant_tyrol': "[ShowModifierEffect('joined_society_elephant_tyrol')]", 'STATIC_MODIFIER_EFFECT_joined_society_with_the_donkey': "[ShowModifierEffect('joined_society_with_the_donkey')]"}
+                                            # localization_prefix='STATIC_MODIFIER_NAME_joined_', localization_suffix='', # Used in 13/15 Examples: {'STATIC_MODIFIER_NAME_joined_order_of_the_black_eagle': 'Joined $order_of_the_black_eagle_policy$', 'STATIC_MODIFIER_NAME_joined_society_hubertus_cologne': 'Joined $society_hubertus_cologne$'}
+                                            # description_localization_prefix='', description_localization_suffix='_policy_desc', # Used in 7/15 Examples: {'order_of_the_ermine_policy_desc': '$order_of_the_ermine_desc$', 'order_of_the_dragon_policy_desc': '$order_of_the_dragon_desc$'}
+                                            # localization_prefix='', localization_suffix='_policy', # Used in 7/15 Examples: {'order_of_the_black_eagle_policy': 'Order of the Black Eagle', 'order_of_the_band_policy': 'Order of the Band'}
                                             )
     @cached_property
     def country_interactions(self) -> dict[str, CountryInteraction]:
@@ -883,9 +1243,6 @@ class Eu5Parser(JominiParser):
     @cached_property
     def ethnicities(self) -> dict[str, Ethnicity]:
         return self.parse_advanced_entities('in_game/common/ethnicities', Ethnicity)
-    @cached_property
-    def flag_definitions(self) -> dict[str, FlagDefinition]:
-        return self.parse_advanced_entities('main_menu/common/flag_definitions', FlagDefinition)
     @cached_property
     def formable_countries(self) -> dict[str, FormableCountry]:
         return self.parse_advanced_entities('in_game/common/formable_countries', FormableCountry,
@@ -1018,9 +1375,32 @@ class Eu5Parser(JominiParser):
                                             # localization_prefix='', localization_suffix='_BUTTON_DETAILS', # Used in 11/11 Examples: {'generic_vassal_ties_BUTTON_DETAILS': 'In turbulent times of uncertainty, we must look to our trusty $vassal$ in order to endure whatever obstacles and foes appear in our path. Only through cooperation and amicable relations shall we persevere!', 'development_of_infrastructure_BUTTON_DETAILS': '$development_of_infrastructure_BUTTON_TOOLTIP$'}
                                             # description_localization_prefix='', description_localization_suffix='_CRITERIA_DESCRIPTION', # Used in 11/11 Examples: {'generic_vassal_ties_CRITERIA_DESCRIPTION': 'Our relationship with our $vassal$ is stronger than ever.', 'development_of_infrastructure_CRITERIA_DESCRIPTION': 'We have developed our capital adequately.'}
                                             )
+
     @cached_property
     def on_action(self) -> dict[str, OnAction]:
-        return self.parse_advanced_entities('in_game/common/on_action', OnAction, allow_empty_entities=True)
+        return self.parse_advanced_entities('in_game/common/on_action', OnAction,
+                                            allow_empty_entities=True,
+                                            transform_value_functions={
+                                                'random_events': lambda tree: [
+                                                    (weight, None if event_id == 0 else self.events[event_id]) for
+                                                    weight, event_id in
+                                                    tree.iterate_with_duplicates()
+                                                    if weight not in ['chance_of_no_event', 'chance_to_happen', 'sample_count']
+                                                ],
+                                            },
+                                            extra_data_functions={
+                                                'random_events_chance_of_no_event': lambda name, data:
+                                                self.resolve_entity_reference(ScriptValue, data['random_events']['chance_of_no_event']) if 'random_events' in data and 'chance_of_no_event' in
+                                                                             data['random_events'] else None,
+                                                'random_events_chance_to_happen': lambda name, data:
+                                                data['random_events'][
+                                                    'chance_to_happen'] if 'random_events' in data and 'chance_to_happen' in
+                                                                           data['random_events'] else None,
+                                                'random_events_sample_count': lambda name, data: data['random_events'][
+                                                    'sample_count'] if 'random_events' in data and 'sample_count' in
+                                                                       data['random_events'] else None
+                                            }
+                                            )
     @cached_property
     def parliament_agendas(self) -> dict[str, ParliamentAgenda]:
         return self.parse_advanced_entities('in_game/common/parliament_agendas', ParliamentAgenda,
@@ -1116,9 +1496,19 @@ class Eu5Parser(JominiParser):
             """
             replacement_regexes = {r'(?m)^(\s*)(\$[^$]+\$)\s*$': r'\1_only_parameter = "\2"'}
 
+        def create_effect(name, data):
+            if isinstance(data, Tree):
+                return Effect(data.dictionary)
+            elif isinstance(data, list) and len(data) == 0:
+                return None
+            else:
+                raise Exception(f'unexpected data type {type(data)} for scripted effect {name}')
+
         return self.parse_advanced_entities('in_game/common/scripted_effects', ScriptedEffect,
                                             allow_empty_entities=True,
-                                            parsing_workarounds=[ScriptedEffectsWorkaround()])
+                                            parsing_workarounds=[ScriptedEffectsWorkaround()],
+                                            extra_data_functions={'effect': create_effect}
+                                            )
     @cached_property
     def scripted_lists(self) -> dict[str, ScriptedList]:
         return self.parse_advanced_entities('in_game/common/scripted_lists', ScriptedList,
@@ -1131,8 +1521,11 @@ class Eu5Parser(JominiParser):
                                             )
     @cached_property
     def scripted_triggers(self) -> dict[str, ScriptedTrigger]:
-        triggers = self.parse_advanced_entities('main_menu/common/scripted_triggers', ScriptedTrigger)
-        triggers.update(self.parse_advanced_entities('in_game/common/scripted_triggers', ScriptedTrigger))
+        extra_data_functions = {
+            'trigger': lambda name, data: Trigger(data.dictionary)
+        }
+        triggers = self.parse_advanced_entities('main_menu/common/scripted_triggers', ScriptedTrigger, extra_data_functions=extra_data_functions)
+        triggers.update(self.parse_advanced_entities('in_game/common/scripted_triggers', ScriptedTrigger, extra_data_functions=extra_data_functions))
         return triggers
     @cached_property
     def situations(self) -> dict[str, Situation]:
@@ -1152,7 +1545,7 @@ class Eu5Parser(JominiParser):
             short_name = right
         display_name = self.localize(f'{short_name}_focus')
         modifier = self.parse_modifier_section(societal_value_name, data, f'{side}_modifier', Eu5Modifier)
-        return SocietalValueOneSide(name, display_name, short_name=short_name, modifier=modifier)
+        return SocietalValueOneSide(name, display_name, short_name=short_name, modifier=modifier, side=side)
 
     @cached_property
     def societal_values(self) -> dict[str, SocietalValue]:
@@ -1176,6 +1569,12 @@ class Eu5Parser(JominiParser):
         return self.parse_advanced_entities('in_game/common/subject_types', SubjectType,
                                             # localization_prefix='', localization_suffix='', # Used in 19/19 Examples: {'tributary': 'Tributary', 'appanage': 'Appanage'}
                                             description_localization_prefix='', description_localization_suffix='_desc', # Used in 19/19 Examples: {'trade_company_desc': "A $trade_company$ is an investment conglomerate, directed at incurring monetary benefits for itself and its [overlord|e]. They are always a [ShowGovernmentTypeName('republic')] and get increased [ShowModifierTypeName('trade_efficiency')], as well as increased payment obligations to their overlord compared to a regular [ShowSubjectTypeName('vassal')].", 'dominion_desc': "A $dominion$ is a self-governed [subject|e] with relative autonomy, exclusive for a [ShowGovernmentTypeName('monarchy')] of the same [religion_group|e] as the [overlord|e]. Additionally, to be able to create a $dominion$, both countries must be in a [union|e] or the overlord must be either $ENG$ or $GBR$. A $dominion$ enjoys increased [ShowModifierTypeName('country_cabinet_efficiency')], a bigger increase compared to a regular [ShowSubjectTypeName('vassal')]."}
+                                            )
+    @cached_property
+    def town_rights(self) -> dict[str, TownRights]:
+        return self.parse_advanced_entities('in_game/common/town_rights', TownRights,
+                                            # localization_prefix='', localization_suffix='', # Used in 50/50 Examples: {'ville_franche_town_rights': 'Ville Franche Rights', 'mining_charter': 'Mining Charter'}
+                                            description_localization_prefix='', description_localization_suffix='_desc',  # Used in 50/50 Examples: {'royal_textile_rights_desc': "This [location|e] has been granted legal privileges over the production and distribution of [ShowGoodsName('cloth')] and [ShowGoodsName('fine_cloth')], conferring a significant competitive advantage.", 'fuero_de_aragon_town_rights_desc': 'The $fuero_de_aragon_town_rights$ compiled the various municipal rights that spread throughout $aragon_area$ during its expansion. Therefore, they are rigorously defended by both the $nobles_estate$ and the $peasants_estate$.'}
                                             )
     @cached_property
     def town_setups(self) -> dict[str, TownSetup]:
@@ -1240,3 +1639,36 @@ class Eu5Parser(JominiParser):
                                             localization_prefix='war_goal_', # Used in 53/53 Examples: {'war_goal_hundred_years_war_wargoal': 'Win The Hundred Years War', 'war_goal_clan_expansion_wargoal': 'Clan Expansion'}
                                             description_localization_prefix='war_goal_', description_localization_suffix='_desc', # Used in 53/53 Examples: {'war_goal_take_country_desc': '[war_goal|e] is to take the enemy country. Get bonus [war_score|e] from winning sieges of enemy fortifications and from occupying enemy territory.', 'war_goal_take_capital_imperial_desc': "[war_goal|e] is to take Emperor's Capital."}
                                             )
+
+    @cached_property
+    def wiki_images(self) -> list[WikiImage]:
+        image_file_references = []
+
+        # unit illustrations
+        for dlc in self.dlcs_including_base_game.values():
+            for file in (dlc.path / 'main_menu/gfx/interface/illustrations/units').glob('*.dds'):
+                relative_path = file.relative_to(self.parser.base_folder)
+                top_folder = relative_path.parts[0]
+                relative_path = relative_path.relative_to(top_folder)
+                image_file_references.append(WikiImageFileReference(
+                    f'Unit illustration {file.stem.replace("_", " ").strip()}.png',
+                    'Unit illustrations',
+                    f'Uploaded from {{{{path|{relative_path}|{top_folder}}}}}.',
+                    True,
+                    image_reference=file,
+                    image_data_hash=hashlib.sha256(file.read_bytes()).hexdigest(),
+                ))
+
+        image_files: dict[str, WikiImageFile] = {}
+        sorted_refs = sorted(filter(lambda x: x is not None, image_file_references),
+                             key=attrgetter('wiki_filename', 'description'))
+        for ref in sorted_refs:
+            if ref is None:
+                continue
+            if ref.image_data_hash not in image_files:
+                image_files[ref.image_data_hash] = WikiImageFile([ref])
+            else:
+                image_files[ref.image_data_hash].references.append(ref)
+
+        return [WikiImage([image_file]) for image_file in
+                sorted(image_files.values(), key=attrgetter('main_wiki_filename'))]

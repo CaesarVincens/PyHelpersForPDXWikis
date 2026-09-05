@@ -1,18 +1,17 @@
 import json
 import re
-import sys
 from collections import ChainMap
-from dataclasses import dataclass
 from itertools import groupby
 
 from colormath.color_conversions import convert_color
 from colormath.color_objects import sRGBColor, HSVColor
 from enum import Flag, Enum
-from functools import cached_property, lru_cache
+from functools import cached_property, lru_cache, total_ordering
 from typing import Any, Callable, Dict, get_origin, get_args, get_type_hints, TypeVar
 from pathlib import Path
 
 from common.paradox_parser import Tree
+from common.wiki_image import WikiImageFileReference
 
 try:
     # when used by PyHelpersForPDXWikis
@@ -46,6 +45,7 @@ class Game:
     # these properties have to be set by the subclasses
     name: str
     short_game_name: str
+    alternative_name: str = None
     game_path: Path
     documents_path: Path
     launcher_settings: Path
@@ -59,7 +59,7 @@ class Game:
         return json_object['rawVersion'].removeprefix('v')
 
     @cached_property
-    def full_version(self):
+    def full_version(self) -> str:
         json_object = json.load(open(self.launcher_settings, encoding='utf-8'))
         self.version = json_object['rawVersion'].removeprefix('v')
         return json_object['version']
@@ -82,6 +82,18 @@ class Game:
         path = CACHEPATH / self.short_game_name / re.sub(r'[^a-zA-Z0-9._]', '_', self.full_version)
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    @cached_property
+    def checksum(self) -> str | None:
+        checksum_file = self.game_path / 'binaries/checksum.txt'
+        if checksum_file.exists():
+            full_checksum = checksum_file.read_text().strip()
+            return full_checksum[-4:]
+        version_extra = re.search(r'\((.*?)\)$', self.full_version)
+        if version_extra is None:
+            return None
+        else:
+            return version_extra.group(1)
 
 
 class PdxColor(sRGBColor):
@@ -151,13 +163,38 @@ class PdxColor(sRGBColor):
         return self.get_css_color_string()
 
 
-class NameableEntity:
+class ParsableObject:
+    """For objects which get parsed from Tree, but which have no name and are not an entity in the game"""
+
+    # for attributes which have a different name in the object than in the game files (e.g. to avoid reserved words)
+    attribute_name_map = {}
+
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def all_annotations(cls) -> ChainMap:
+        """Returns a dictionary-like ChainMap that includes annotations for all
+           attributes defined in cls or inherited from superclasses."""
+        return ChainMap(*(get_type_hints(c) for c in cls.mro()))
+
+    @cached_property
+    def default_values(self):
+        return {attribute: value for attribute, value in vars(self.__class__).items()
+                if not attribute.startswith('__')
+                and not callable(value)
+                and not isinstance(value, cached_property)
+                }
+
+
+@total_ordering
+class NameableEntity(ParsableObject):
     def __init__(self, name: str, display_name: str, **kwargs):
         self.name = name
         self.display_name = display_name
-
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+        super().__init__(**kwargs)
 
     def __repr__(self):
         string = super().__repr__()
@@ -178,21 +215,6 @@ class NameableEntity:
 
     def __lt__(self, other):
         return self.display_name < str(other)
-
-    @cached_property
-    def default_values(self):
-        return {attribute: value for attribute, value in vars(self.__class__).items()
-                if not attribute.startswith('__')
-                and not callable(value)
-                and not isinstance(value, cached_property)
-                }
-
-    @classmethod
-    @lru_cache(maxsize=1)
-    def all_annotations(cls) -> ChainMap:
-        """Returns a dictionary-like ChainMap that includes annotations for all
-           attributes defined in cls or inherited from superclasses."""
-        return ChainMap(*(get_type_hints(c) for c in cls.mro()))
 
 
 class IconMixin:
@@ -247,7 +269,7 @@ class IconMixin:
     def get_wiki_filename(self) -> str:
         if not self.icon:
             return ''
-        filename = self.icon.split('/')[-1].replace('.dds', '.png')
+        filename = self.icon.split('/')[-1].replace('.dds', '.png').replace('.tga', '.png')
         prefix = self.get_wiki_filename_prefix()
         if not filename.lower().startswith(prefix.lower()):
             filename = prefix + ' ' + filename
@@ -257,9 +279,59 @@ class IconMixin:
         """Defaults to the class name. Subclasses can override it to provide their actual names"""
         return self.get_class_name_as_wiki_page_title()
 
+    def get_wiki_file_category(self) -> str:
+        return f'{self.get_class_name_as_wiki_page_title()} icons'
+
+    def get_wiki_file_description(self) -> str:
+        return ''
+
     def get_wiki_page_name(self) -> str:
         """Defaults to the class name. Subclasses can override it to provide their actual names"""
         return self.get_class_name_as_wiki_page_title()
+
+    def get_wiki_image_file_reference(self) -> WikiImageFileReference | None:
+        if not self.icon:
+            return None
+
+        reference = self.get_image_reference()
+        if not reference:
+            return None
+
+        return WikiImageFileReference(
+            self.get_wiki_filename(),
+            self.get_wiki_file_category(),
+            self.get_wiki_file_description(),
+            self.is_image_reference_main_reference(),
+            self.get_alternative_wiki_filenames(),
+            self.get_obsolete_wiki_filenames(),
+            reference,
+            self.get_image_data_hash(),
+        )
+
+    def get_image_reference(self) -> Path | Any | None:
+        """the reference is game specific. It can be a path to an actual file or a reference to a texture"""
+        raise NotImplementedError('Subclasses must override this function')
+
+    def get_image_data_hash(self) -> str | None:
+        """the hash has to be calculated in a game specific way,
+        but it should be the sha256 hash over the raw pixel data
+         to detect identical images from different files"""
+        raise NotImplementedError('Subclasses must override this function')
+
+    def get_alternative_wiki_filenames(self) -> list[str]:
+        """for redirects; if one of these contains the image, it should be moved to one of the main filenames"""
+        return []
+
+    def get_obsolete_wiki_filenames(self) -> list[str]:
+        """these should not be created anymore, but can be used to find an old version of the image which can be moved"""
+        return []
+
+    def is_image_reference_main_reference(self) -> bool:
+        """Should be overridden with game specific code"""
+        image_reference = self.get_image_reference()
+        if isinstance(image_reference, Path):
+            return image_reference.name == self.name
+        return False
 
 
 class IconEntity(NameableEntity, IconMixin):
@@ -325,7 +397,7 @@ class AttributeEntity:
 
 class ModifierType(NameableEntity):
     percent: bool = False
-    already_percent: bool = False  # used by ck3
+    already_percent: bool = False  # used by ck3 and eu5
     boolean: bool = False
     decimals: int = None
     good: bool = None
@@ -344,6 +416,8 @@ class ModifierType(NameableEntity):
 
     def __init__(self, name: str, display_name: str, **kwargs):
         super().__init__(name, display_name, **kwargs)
+        # reset display name attribute so that the cached property can be used
+        del self.display_name
         if self.decimals is not None:
             self.decimals = self.decimals
         if self.color == 'good':
@@ -352,17 +426,23 @@ class ModifierType(NameableEntity):
             self.good = False
         if self.color == 'neutral':
             self.neutral = True
-        self.display_name, self.description = self._get_fully_localized_display_name_and_desc()
 
-    def _get_fully_localized_display_name_and_desc(self) -> (str, str):
+    @cached_property
+    def display_name(self) -> str:
+        """Lazy load to avoid infinite loop if the localization references something which needs modifiers"""
         display_name = self.parser.localize(
             key='modifier_' + self.name,
             # version 1.7 removed the modifier_ prefix from the localisations, but I'm not sure if that's always the case, so this code allows both
             default=self.parser.localize(self.name))
         display_name = self.parser.formatter.format_localization_text(display_name, [])
+        return display_name
+
+    @cached_property
+    def description(self) -> str:
+        """Lazy load to avoid infinite loop if the localization references something which needs modifiers"""
         description = self.parser.localize(self.name + '_desc')
         description = self.parser.formatter.format_localization_text(description, [])
-        return display_name, description
+        return description
 
     @cached_property
     def icon(self):
@@ -441,6 +521,8 @@ class ModifierType(NameableEntity):
             self.assert_number(value)
             formatted_value *= 100
             postfix += '%'
+        elif self.already_percent:
+            postfix += '%'
 
         if self.decimals is not None:
             try:
@@ -504,4 +586,5 @@ class GameConcept(AdvancedEntity):
 
 AE = TypeVar('AE', bound=AdvancedEntity)
 NE = TypeVar('NE', bound=NameableEntity)
+PE = TypeVar('PE', bound=ParsableObject)
 ME = TypeVar('ME', bound=Modifier)

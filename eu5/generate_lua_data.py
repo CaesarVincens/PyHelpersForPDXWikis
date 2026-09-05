@@ -4,8 +4,11 @@ Generates lua data modules
 
 """
 import luadata
+import os
 import sys
 
+# add the parent folder to the path so that imports work even if this file gets executed directly
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from eu5.eu5_file_generator import Eu5FileGenerator
 
 
@@ -34,6 +37,7 @@ local NDefines = {luadata.serialize(result, indent=' ')}
                 mod_data['format'] = mod_type.format
             mod_data['color'] = mod_type.color
             mod_data['decimals'] = mod_type.decimals
+            mod_data['category'] = mod_type.category
 
             if mod_type.icon_file != self.parser.default_modifier_icon:
                 mod_data['icon'] = mod_type.get_wiki_filename().removesuffix('.png')

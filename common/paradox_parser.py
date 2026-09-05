@@ -10,9 +10,9 @@ import os
 import re
 import subprocess
 from pathlib import Path
-from collections.abc import Iterator, MutableMapping
+from collections.abc import MutableMapping
 from tempfile import mkstemp
-from typing import Callable, Any
+from typing import Callable, Any, Iterator
 
 try:  # when used by PyHelpersForPDXWikis
     from PyHelpersForPDXWikis.localsettings import RAKALY_CLI
@@ -57,6 +57,18 @@ class IgnoreAtVariablesWorkaround(ParsingWorkaround):
     replacement_regexes = {r'(?m)^\s*@[a-zA-Z]+[^\n]*\n?': ''}
 
 
+class ScriptedWorkaround(ParsingWorkaround):
+    """
+    replaces
+        scripted_effect minor_earthquake_payment = {
+    with
+        scripted_effect = { id = minor_earthquake_payment
+    """
+    replacement_regexes = {
+        r'(?m)^scripted_(effect|trigger)\s+([^\s={}#]+)\s*=\s*\{': r'scripted_\1 = { id = \2',
+    }
+
+
 class ParadoxParser:
     """the parse_ methods parse paradox development studio game scripts into python objects"""
 
@@ -86,7 +98,8 @@ class ParadoxParser:
 
     def parse_folder_as_one_file(self, folder: str, recursive=True, file_extension='txt',
                                  workarounds: list[ParsingWorkaround] = None,
-                                 overwrite_duplicate_toplevel_keys=True) -> 'Tree':
+                                 overwrite_duplicate_keys_at_level: int|None = 0,
+                                 ) -> 'Tree':
         """Parse all text files in a folder with rakaly and merge them into one Tree.
 
         If there are duplicate keys, their values will be grouped into a list(rakaly --duplicate-keys group).
@@ -97,11 +110,11 @@ class ParadoxParser:
             recursive: parse subfolders as well
             file_extension: only files with this extension will be parsed
             workarounds: workarounds to apply before handling the file to rakaly
-            overwrite_duplicate_toplevel_keys: how to handle duplicate top level keys from different files. If this
-                is set to true, later files will overwrite the keys from previous files. If set to false, the behavior
+            overwrite_duplicate_keys_at_level: how to handle duplicate top level keys from different files. If this
+                is set to 0, later files will overwrite the keys from previous files. If set to None, the behavior
                 depends on the value of the key. If it is a Tree, it will be merged (overwriting keys in that tree if
                 there are duplications) If it is a list, the new value will be appended. Otherwise, it will be turned
-                into a list.
+                into a list. If set to a number above 0, overwriting will start at that level
 
         Returns:
             the merged Tree
@@ -110,14 +123,15 @@ class ParadoxParser:
         glob = '*.' + file_extension
         if recursive:
             glob = '**/' + glob
-        for file in sorted((self.base_folder / folder).glob(glob)):
-            if overwrite_duplicate_toplevel_keys:
+        glob = f'{folder}/{glob}'
+        for file in sorted(self.base_folder.glob(glob)):
+            if overwrite_duplicate_keys_at_level == 0:
                 result.dictionary.update(self._really_parse_file(file, workarounds).dictionary)
             else:
                 for key, value in self._really_parse_file(file, workarounds):
                     if key in result.dictionary:
                         if isinstance(result.dictionary[key], Tree):
-                            result.dictionary[key].dictionary.update(value)
+                            result.dictionary[key].update(value, (overwrite_duplicate_keys_at_level - 1) if overwrite_duplicate_keys_at_level is not None else None)
                         elif isinstance(result.dictionary[key], list):
                             result.dictionary[key].append(value)
                         else:
@@ -158,14 +172,45 @@ class ParadoxParser:
             return self._run_rakaly(file)
 
     def _run_rakaly(self, file: Path):
-        rakaly_result = subprocess.run([RAKALY_CLI, 'json', '--format', 'utf-8', '--interpolation', '--duplicate-keys', 'group', file], capture_output=True)
+        rakaly_result = subprocess.run([RAKALY_CLI, 'json', '--format', 'utf-8', '--interpolation', '--duplicate-keys', 'preserve', file], capture_output=True)
         if rakaly_result.returncode != 0:
             rakaly_error_message = str(rakaly_result.stderr, 'UTF-8')[:-1]  # [:-1] removes the final linebreak
             raise Exception('Error reading "{}": {}'.format(file, rakaly_error_message))
-        return self._parse_json(rakaly_result.stdout)
+        return self.json_to_tree(rakaly_result.stdout)
 
-    def _parse_json(self, rakaly_result: str) -> 'Tree':
-        return json.loads(rakaly_result, object_hook=lambda x: Tree(x))
+    def parse_ordered_pairs_into_tree(self, ordered_pairs) -> 'Tree|TreeWithDuplicates':
+        """
+        Returns a Tree from the ordered pairs
+
+        if there are duplicate keys, it returns a TreeWithDuplicates instead
+        in this case, the Tree gets both a dict and the ordered_pairs. In the dict,
+        the values for duplicate keys are turned into a list. But this does not preserve
+        the order of the duplicate keys. If these are needed,, the ordered_pairs in
+        TreeWithDuplicates have to be used
+        """
+        pairs_as_dict = {}
+        # keep track of duplicate keys, both to determine if there are duplicates
+        # and to know if the values of the duplicate key have already been turned into
+        # a list. We can't check the type of the value, because the value could have been a list to begin with
+        seen_duplicates = set()
+        for key, value in ordered_pairs:
+            if key in pairs_as_dict:
+                if key in seen_duplicates:
+                    pairs_as_dict[key].append(value)
+                else:
+                    pairs_as_dict[key] = [pairs_as_dict[key], value]
+                    seen_duplicates.add(key)
+            else:
+                pairs_as_dict[key] = value
+
+        if len(seen_duplicates) > 0:
+            return TreeWithDuplicates(pairs_as_dict, ordered_pairs)
+        else:
+            return Tree(pairs_as_dict)
+
+
+    def json_to_tree(self, json_string: str) -> 'Tree':
+        return json.loads(json_string, object_pairs_hook=self.parse_ordered_pairs_into_tree)
 
 
 class Tree(MutableMapping):
@@ -194,6 +239,18 @@ class Tree(MutableMapping):
         that we want to iterate over the items.
         """
         return iter(self.dictionary.items())
+
+    def iterate_with_duplicates(self) -> Iterator[tuple[str, Any]]:
+        """iterates over the items in this tree as tuples of key value pairs
+
+        Keys can appear multiple times and are preserved in the order which they had in the file.
+        In contrast, the default __iter__() turns the value of duplicate keys into lists. But this
+        makes them appear together even if the there were other keys inbetween
+
+        this is the basic implementation for the case that there are no duplicate keys.
+        Subclasses with duplicate keys must override this
+        """
+        return self.__iter__()
 
     def keys(self):
         return self.dictionary.keys()
@@ -234,6 +291,20 @@ class Tree(MutableMapping):
                     if isinstance(item, Tree):
                         yield from item.find_all_recursively(search_key)
 
+    def find_all_recursively_with_parents(self, search_key: str, parents: list[str] = None) -> Iterator[tuple[list[str], Any]]:
+        """Like find_all_recursively, but also returns the keys which were descended to find the search term"""
+        if parents is None:
+            parents = []
+        for key, value in self.iterate_with_duplicates():
+            if key == search_key:
+                yield parents, value,
+            elif isinstance(value, Tree):
+                yield from value.find_all_recursively_with_parents(search_key, parents + [key])
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, Tree):
+                        yield from item.find_all_recursively_with_parents(search_key, parents + [key])
+
     def merge_duplicate_keys(self):
         """merges duplicate keys which have Tree as their value
 
@@ -252,7 +323,7 @@ class Tree(MutableMapping):
         """create a new tree which only contains the elements for which filter_func returns True"""
         return Tree({k: v for k, v in self.dictionary.items() if filter_func(k, v)})
 
-    def update(self, other: 'Tree') -> 'Tree':
+    def update(self, other: 'Tree', overwrite_duplicate_keys_at_level: int|None = None) -> 'Tree':
         """Update the tree with the key/value pairs from other. Existing keys are handled depending on the type
         of the value:
 
@@ -261,10 +332,14 @@ class Tree(MutableMapping):
         everything else: the value from the other tree overwrites the value from this tree"""
 
         for key, value in other:
-            if key in self:
+            if key in self and overwrite_duplicate_keys_at_level != 0:
                 if isinstance(value, Tree):
                     if isinstance(self[key], Tree):
-                        self[key].update(value)
+                        self[key].update(value,  (overwrite_duplicate_keys_at_level - 1) if overwrite_duplicate_keys_at_level is not None else None)
+                    elif isinstance(self[key], list) and len(self[key]) == 0:
+                        self[key] = value
+                    elif isinstance(self[key], list) and isinstance(self[key][0], Tree):
+                        self[key].append(value)
                     else:
                         raise Exception(f'mismatching types for key "{key}" when updating tree. The value from this tree is a "{type(self[key])}" and the value from the other tree is a "{type(value)}".')
                 elif isinstance(value, MutableMapping):
@@ -294,6 +369,73 @@ class Tree(MutableMapping):
     def __setstate__(self, state):
         self.dictionary = state
 
+    def _to_dict_one_value(self, value: Any) -> Any:
+        if isinstance(value, Tree):
+            return value.to_dict()
+        elif isinstance(value, list):
+            return [self._to_dict_one_value(v) for v in value]
+        else:
+            return value
+
     def to_dict(self) -> dict:
         """recursively convert the tree into a dict"""
-        return {k: v.to_dict() if isinstance(v, Tree) else v for k, v in self}
+        return {k: self._to_dict_one_value(v) for k, v in self}
+
+    def _lowercase(self, obj):
+        """ Make dictionary lowercase
+            from: https://stackoverflow.com/a/40789531
+         """
+        if isinstance(obj, dict):
+            return {k.lower(): self._lowercase(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, set, tuple)):
+            t = type(obj)
+            return t(self._lowercase(o) for o in obj)
+        elif isinstance(obj, str):
+            return obj.lower()
+        else:
+            return obj
+
+    def is_equal_to_dict(self, comparison_dict: dict, case_sensitive = False) -> bool:
+        self_dict = self.to_dict()
+        if not case_sensitive:
+            self_dict = self._lowercase(self_dict)
+            comparison_dict = self._lowercase(comparison_dict)
+        return self_dict == comparison_dict
+
+
+class TreeWithDuplicates(Tree):
+
+    def __init__(self, dictionary: dict, ordered_pairs: list[tuple[str, Any]]):
+        super().__init__(dictionary)
+        self.ordered_pairs = ordered_pairs
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self.ordered_pairs = [(k, v) for k, v in self.ordered_pairs if k != key]
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self.ordered_pairs.append((key, value))
+
+    def __getstate__(self):
+        return self.dictionary, self.ordered_pairs
+
+    def __setstate__(self, state):
+        self.dictionary, self.ordered_pairs = state
+
+    def iterate_with_duplicates(self) -> Iterator[tuple[str, Any]]:
+        """iterates over the items in this tree as tuples of key value pairs
+
+        Keys can appear multiple times and are preserved in the order which they had in the file.
+        In contrast, the default __iter__() turns the value of duplicate keys into lists. But this
+        makes them appear together even if the there were other keys inbetween
+        """
+        return iter(self.ordered_pairs)
+
+    def update(self, other: 'Tree', overwrite_duplicate_keys_at_level: int|None = None) -> 'Tree':
+        if isinstance(other, TreeWithDuplicates):
+            self.ordered_pairs.extend(other.ordered_pairs)
+        else:
+            for key, value in other:
+                self.ordered_pairs.append((key, value))
+        return super().update(other, overwrite_duplicate_keys_at_level)

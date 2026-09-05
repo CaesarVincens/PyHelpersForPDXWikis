@@ -1,5 +1,4 @@
 import re
-from decimal import Decimal
 
 from common.paradox_lib import NameableEntity
 from common.paradox_parser import Tree
@@ -28,6 +27,8 @@ class Eu5WikiTextFormatter(Vic3WikiTextFormatter):
             return self.parser.localize(f'{parameter}_focus')
         if data_function == 'GetCountry' and name_function in ['GetAdjectiveWithNoTooltip', 'GetAdjective']:
             return self.parser.localize(f'{parameter}_ADJ')
+        if data_function == 'GetCountry' and name_function in ['GetLongName', 'GetLongNameWithNoTooltip'] and parameter in self.parser.countries:
+            return self.parser.countries[parameter].long_name
         return self.parser.localize(parameter)
 
     def apply_localization_formatting(self, text: str) -> str:
@@ -72,16 +73,6 @@ class Eu5WikiTextFormatter(Vic3WikiTextFormatter):
     def format_trigger(self, trigger: Tree|None):
         if not trigger:
             return ''
-        if isinstance(trigger, list):
-            if len(trigger) == 1:
-                return self.format_conditions(trigger[0])
-            result = []
-            for condition in trigger:
-                if isinstance(condition, Tree):
-                    result.append(self.format_conditions(condition, indent=2))
-                else:
-                    result.append(condition)
-            return self.create_wiki_list(result)
         return self.format_conditions(trigger)
 
     def format_effect(self, effect: Tree|None):
@@ -89,8 +80,45 @@ class Eu5WikiTextFormatter(Vic3WikiTextFormatter):
             return ''
         return self.format_trigger(effect)
 
+    def format_key_value_pair(self, key: str, value, indent):
+        comparison_operators = {
+            'LESS_THAN': '<',
+            'LESS_THAN_EQUAL': '≤',
+            '=': '=',
+            'NOT_EQUAL': 'is not',
+            'GREATER_THAN': '>',
+            'GREATER_THAN_EQUAL': '≥'
+        }
+        if isinstance(value, Tree) and len(value) == 1 and list(value.keys())[0] in comparison_operators:
+            for comparison_str, comparison_value in value:
+                comparison_operator = comparison_operators[comparison_str]
+                if key.startswith('societal_value:'):
+                    typ, _, key_without_prefix = key.partition(':')
+                    return self.parser.societal_values[key_without_prefix].format(comparison_value, comparison_operator)
+        if key in self.parser.scripted_triggers and value is True:
+            return self.format_conditions(self.parser.scripted_triggers[key].trigger, indent)
+        
+        return super().format_key_value_pair(key, value, indent)
+
     def format_simple_statement(self, key, value):
-        return f'{key}: {self.format_RHS(value)}'
+        mapping = {
+            'has_or_had_tag': ('Is or was {value}', self.parser.countries_including_formables),
+            'country_exists': ('{value} exists', self.parser.countries_including_formables),
+            'has_reform': ('Has the {value} Government Reform', self.parser.government_reforms),
+            'country_has_estate': ('Has the {value} estate', self.parser.estates),
+        }
+        if key in mapping:
+            if isinstance(mapping[key], str):
+                return mapping[key]
+            else:
+                try:
+                    value = mapping[key][1][value]
+                except KeyError:
+                    pass
+                value = self.format_RHS(value)
+                return mapping[key][0].format(value=value)
+        else:
+            return f'{key}: {self.format_RHS(value)}'
 
     def format_RHS(self, value) -> str:
         suffix = None
@@ -105,13 +133,15 @@ class Eu5WikiTextFormatter(Vic3WikiTextFormatter):
                 'estate_privilege': self.parser.estate_privileges,
                 'estate_type': self.parser.estates,
                 'goods': self.parser.goods,
-                'languages': self.parser.languages,
+                'government_reform': self.parser.government_reforms,
+                'language': self.parser.languages,
                 'law': self.parser.laws,
                 'policy': self.parser.law_policies,
                 'religion': self.parser.religions,
                 'religion_group': self.parser.religion_groups,
+                'town_rights_type': self.parser.town_rights,
             }
-            if typ in type_sources:
+            if typ in type_sources and value_without_prefix_and_suffix in type_sources[typ]:
                 value = type_sources[typ][value_without_prefix_and_suffix]
             else:
                 suffix = None  # we use the unchanged value, so we don't want to add the suffix to it

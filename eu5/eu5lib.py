@@ -1,12 +1,15 @@
 import copy
 import numbers
 import re
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import cached_property, lru_cache
+from numbers import Number
 from pathlib import Path
 from typing import Any
 
-from common.paradox_lib import GameConcept, NameableEntity, AdvancedEntity, PdxColor, ModifierType, Modifier, IconMixin
+from common.paradox_lib import GameConcept, NameableEntity, AdvancedEntity, PdxColor, ModifierType, Modifier, IconMixin, \
+    ParsableObject
 from common.paradox_parser import Tree
 from eu5.event_target import EventTarget
 from eu5.game import eu5game
@@ -44,13 +47,22 @@ class Eu5ModifierType(ModifierType):
         for k, v in self.game_data:
             setattr(self, k, v)
 
-    def _get_fully_localized_display_name_and_desc(self) -> (str, str):
+
+
+    @cached_property
+    def display_name(self) -> str:
+        """Lazy load to avoid infinite loop if the localization references something which needs modifiers"""
         display_name = self.parser.localize('MODIFIER_TYPE_NAME_' + self.name)
         if display_name != '(unused)':
             display_name = self.parser.formatter.strip_formatting(display_name, strip_newlines=True)
+        return display_name
+
+    @cached_property
+    def description(self) -> str:
+        """Lazy load to avoid infinite loop if the localization references something which needs modifiers"""
         description = self.parser.localize('MODIFIER_TYPE_DESC_' + self.name)
         description = self.parser.formatter.format_localization_text(description, [])
-        return display_name, description
+        return description
 
     def format_value(self, value):
         if isinstance(value, ScriptValue) and value.direct_value:
@@ -86,35 +98,25 @@ class Eu5Modifier(Modifier):
         elif self.name == 'scale':
             return 'generating of triggers not supported yet'  # @TODO
         value_and_name = super().format_for_wiki()
+        if self.modifier_type.ai:
+            value_and_name = f"''{value_and_name}''<ref name=\"{self.modifier_type.name}_only_ai\">The modifier {self.modifier_type.parser.formatter.quote(self.display_name)} is only used for AI decision making and has no impact on countries played by human players</ref>"
         return f'[[File:{self.modifier_type.get_wiki_filename()}|32px]] {value_and_name}'
 
 
-class Eu5NamedModifier(NameableEntity):
-    """Modifier describes several related concepts.
-    This class is for entities from the common/modifiers folder which groups together multiple modifiers and
-    gives them a name, category and description
-    For the individual modifiers see the class Eu5Modifier
-    For the possible types of these modifiers see Eu5ModifierType"""
-
-    category: str
-    description: str = ''
-    decaying: bool = False
-    modifier: list[Eu5Modifier]
-
-    def format_for_wiki(self, time_limit_weeks: int = None) -> str:
-        """@TODO: use wiki template"""
-        return "Modifier ''“{}”''{} giving:\n* {}".format(
-                                                       self.display_name,
-                                                       ' for {} weeks'.format(time_limit_weeks) if time_limit_weeks is not None else '',
-                                                       '\n* '.join([modifier.format_for_wiki() for modifier in self.modifier]))
-
-
 class Eu5AdvancedEntity(AdvancedEntity):
+    _unformatted_description: str = ''
+    _formatter = None
+    """Set in Eu5Parser.parse_advanced_entities()
+    :type: eu5.text_formatter.Eu5WikiTextFormatter"""
 
     icon_folder: str = None
     "either the name of the define in NGameIcons or the folder name relative to game/main_menu/gfx/interface/icons"
 
     base_icon_folder = eu5game.game_path / 'game/main_menu/gfx/interface/icons'
+
+    @cached_property
+    def description(self) -> str:
+        return self._formatter.format_localization_text(self._unformatted_description)
 
     def get_icon_filename(self) -> str:
         if self.icon:
@@ -148,7 +150,7 @@ class Eu5AdvancedEntity(AdvancedEntity):
 
     @classmethod
     @lru_cache
-    def has_wiki_icon(cls):
+    def has_wiki_icon(cls) -> bool:
         try:
             icon_folder = cls.get_icon_folder()
             return icon_folder.exists()
@@ -156,7 +158,15 @@ class Eu5AdvancedEntity(AdvancedEntity):
             return False
 
     def get_icon_path(self) -> Path:
-        return self.get_icon_folder() / self.get_icon_filename()
+        icon = self.get_icon_folder() / self.get_icon_filename()
+        if not icon.exists():
+            relative_folder = str(self.get_icon_folder().relative_to(eu5game.game_path / 'game'))
+            dlc_icons = list(eu5game.game_path.glob(f'game/dlc/*/{relative_folder}/{self.get_icon_filename()}'))
+            if len(dlc_icons) == 1:
+                return dlc_icons[0]
+            elif len(dlc_icons) > 1:
+                raise Exception(f'Multiple icons for "{self.display_name}"({self.name}): {"\n".join(dlc_icons)}')
+        return icon
 
     def get_wiki_filename(self) -> str:
         if not self.has_wiki_icon():
@@ -164,10 +174,11 @@ class Eu5AdvancedEntity(AdvancedEntity):
         filename = self.get_icon_filename().replace('.dds', '.png')
         prefix = self.get_wiki_filename_prefix()
         filename = filename.removeprefix('icon_')
-        if not filename.lower().startswith(prefix.lower()):
-            filename = f'{prefix} {filename}'
         filename = filename.replace(':', '')
         filename = filename.replace('_', ' ')
+        prefix = prefix.replace('_', ' ')
+        if not filename.lower().startswith(prefix.lower()):
+            filename = f'{prefix} {filename}'
         return filename.capitalize()
 
     def get_wiki_icon(self, size: str = '32px') -> str:
@@ -176,15 +187,105 @@ class Eu5AdvancedEntity(AdvancedEntity):
         return self.get_wiki_file_tag(size, link='self')
 
 
+class Eu5NamedModifier(Eu5AdvancedEntity):
+    """Modifier describes several related concepts.
+    This class is for entities from the common/modifiers folder which groups together multiple modifiers and
+    gives them a name, category and description
+    For the individual modifiers see the class Eu5Modifier
+    For the possible types of these modifiers see Eu5ModifierType"""
+
+    category: str
+    decaying: bool = False
+    modifier: list[Eu5Modifier]
+
+    def format_for_wiki(self, time_limit_weeks: int = None) -> str:
+        """@TODO: use wiki template"""
+        return "Modifier ''“{}”''{} giving:\n* {}".format(
+                                                       self.display_name,
+                                                       ' for {} weeks'.format(time_limit_weeks) if time_limit_weeks is not None else '',
+                                                       '\n* '.join([modifier.format_for_wiki() for modifier in self.modifier]))
+
+
+class ScriptedEffect(Eu5AdvancedEntity):
+    effect: Effect
+
+
+class ScriptedTrigger(Eu5AdvancedEntity):
+    trigger: Trigger
+
+
 class ScriptValue(NameableEntity):  # can't have a name, but we want to use logic of the parent class
     direct_value: float|str = None  # if it is defined as name_of_scripted_value = value
     desc: str = ''
     value: float|str = None
     calculations:Tree = None  # everything else has to be processed in order
 
-    def format(self):
+    def format(self,entity=None):
         if self.direct_value:
             return self.direct_value
+        elif self.value and len(self.calculations) == 0:
+            return self.value
+        elif list(self.calculations.keys()) == ['add'] and isinstance(self.calculations['add'], (Number, str)):
+            result = self.calculations['add']
+            if self.value:
+                if isinstance(result, Number):
+                    result += self.value
+                else:
+                    result = f'{self.value} + {result}'
+            return str(result)
+        elif list(self.calculations.keys()) == ['if'] and isinstance(self.calculations['if'], Tree):
+            conditions = eu5game.parser.formatter.format_conditions(self.calculations['if']['limit'], 2).strip()
+            if '\n' not in conditions:
+                conditions = re.sub(r'^[*\s]*', '', conditions)
+                result = [f'If {conditions}:']
+            else:
+                result = [f'If:\n{conditions}',
+                      'then:'
+                      ]
+            calculations = []
+            # TODO: better implementation with recursion
+            # TODO: we need a different parser to get a reliable order,
+            #  because the rakaly parameters which we are using will turn duplicated keys into
+            # a list, but this would turn add, mul, add into [add, add], mul which gives
+            # a different result
+            for k, v in self.calculations['if']:
+                if k == 'limit':
+                    pass  # already handled
+                elif k == 'add':
+                    if isinstance(v, Tree):
+                        # TODO: add parenthesis back for nested formulas
+                        # calculations.append('+(')
+                        for k2, v2 in v:
+                            if isinstance(v2, (Tree, list)):
+                                return 'Showing the full calculation is not implemented yet'
+                            if k2 == 'value':
+                                calculations.append(f'{v2}')
+                            elif k2 == 'add':
+                                calculations.append(f'+ {v2}')
+                            elif k2 =='subtract':
+                                calculations.append(f'- {v2}')
+                            elif k2 =='multiply':
+                                calculations.append(f'* {v2}')
+                            elif k2 =='divide':
+                                calculations.append(f'/ {v2}')
+                            elif k2 =='modulo':
+                                calculations.append(f'mod {v2}')
+                            elif k2 =='max':
+                                calculations.append(f'max {v2}')
+                            elif k2 =='min':
+                                calculations.append(f'min {v2}')
+                            else:
+                                return 'Showing the full calculation is not implemented yet'
+                        # TODO: add parenthesis back for nested formulas
+                        # calculations.append(')')
+                    elif isinstance(v, (Number, str)):
+                        calculations.append(f'+{v}')
+                    else:
+                        return 'Showing the full calculation is not implemented yet'
+                else:
+                    return 'Showing the full calculation is not implemented yet'
+            result.append([' '.join(calculations)])
+            return eu5game.parser.formatter.create_wiki_list(result)
         else:
             if self.desc:
                 tooltip_text = self.desc
@@ -347,40 +448,46 @@ class Continent(NameableEntity):
 
 
 class Advance(Eu5AdvancedEntity):
-    age: str
-    ai_preference_tags: list = [str]
-    ai_weight: Tree = None
+    age: 'Age'
+    ai_preference_tags: list[str] = []
+    ai_weight: ScriptValue = None
     allow: Trigger = None
     allow_children: bool = True
+    content_priority: int = 0
     country_type: str = None
     depth: int = None
     age_specialization: str = None  # called "for" in the files, but that's a reserved word in python
-    government: str = None
-    in_tree_of: Any = None # possible types: {<class 'list'>, <class 'str'>}
+    government: 'GovernmentType' = None
+    modifiers: list[Eu5Modifier] = []
     modifier_while_progressing: list[Eu5Modifier] = []
     potential: Trigger = None
 
     # saved as str when parsing to avoid recursion
-    _requires: list['Advance'] = []
+    _requires: list[str] = []
+    _in_tree_of: str = None
 
     research_cost: float = None # percentage?
     starting_technology_level: int = 0
-    unlock_ability: list[str] = []
-    unlock_building: list[str] = []
-    unlock_cabinet_action: list[str] = []
-    unlock_casus_belli: list[str] = []
-    unlock_country_interaction: list[str] = []
-    unlock_diplomacy: list[str] = []
-    unlock_estate_privilege: list[str] = []
-    unlock_government_reform: list[str] = []
-    unlock_heir_selection: list[str] = []
-    unlock_law: list[str] = []
+    unlock_ability: list['UnitAbility'] = []
+    unlock_building: list['Building'] = []
+    unlock_cabinet_action: list['CabinetAction'] = []
+    unlock_casus_belli: list['CasusBelli'] = []
+    unlock_chivalric_order: list['ChivalricOrder'] = []
+    unlock_country_interaction: list['CountryInteraction'] = []
+    unlock_diplomacy: list['Eu5GameConcept'] = []
+    unlock_estate_privilege: list['EstatePrivilege'] = []
+    unlock_government_reform: list['GovernmentReform'] = []
+    unlock_heir_selection: list['HeirSelection'] = []
+    unlock_interaction: list['CharacterInteraction'] = []
+    unlock_law: list['Law'] = []
     unlock_levy: list['Levy'] = []
-    unlock_policy: list[str] = []
-    unlock_production_method: list[str] = []
-    unlock_road_type: list[str] = []
-    unlock_subject_type: list[str] = []
-    unlock_unit: list[str] = []
+    unlock_policy: list['LawPolicy'] = []
+    unlock_production_method: list['ProductionMethod'] = []
+    unlock_relation_type: list['ScriptedRelation'] = []
+    unlock_road_type: list['RoadType'] = []
+    unlock_subject_type: list['SubjectType'] = []
+    unlock_town_rights: list['TownRights'] = []
+    unlock_unit: list['UnitType'] = []
 
     icon_folder = 'ADVANCE_ICON_PATH'
 
@@ -389,6 +496,11 @@ class Advance(Eu5AdvancedEntity):
             # saved as private attribute and removed to not override the cached_property
             self._requires = kwargs['requires']
             del kwargs['requires']
+        if 'in_tree_of' in kwargs:
+            # saved as private attribute and removed to not override the cached_property
+            self._in_tree_of = kwargs['in_tree_of']
+            del kwargs['in_tree_of']
+
         super().__init__(name, display_name, **kwargs)
 
     @cached_property
@@ -401,14 +513,85 @@ class Advance(Eu5AdvancedEntity):
         else:
             return []
 
+    @cached_property
+    def in_tree_of(self) -> 'Advance|None':
+        """Lazy loaded to avoid infinite recursion"""
+        if self._in_tree_of:
+            return eu5game.parser.advances[self._in_tree_of]
+        else:
+            return None
+
     def get_wiki_icon(self, size: str = '32px') -> str:
         if self.get_wiki_filename().removesuffix(".png") == self.display_name:
             localized_name_param = ''
         else:
             localized_name_param = f'|{self.display_name}'
 
-        return f'{{{{Advance|{self.get_wiki_filename().removesuffix(".png")}{localized_name_param}|w={size}}}}}'
+        return f'{{{{Advance icon|{self.get_wiki_filename().removesuffix(".png")}{localized_name_param}|link={self.get_wiki_link_target()}|w={size}|filename={self.get_wiki_filename()}}}}}'
 
+    def get_wiki_page_name(self) -> str:
+        return self.age.get_wiki_page_name()
+
+    def get_wiki_filename(self) -> str:
+        advance: Eu5AdvancedEntity
+        if self.unlock_unit:
+            advance = self.unlock_unit[0].category
+        elif self.unlock_levy:
+            advance = self.unlock_levy[0].unit.category
+        elif self.unlock_building:
+            advance = self.unlock_building[0]
+        elif self.unlock_production_method:
+            advance = self.unlock_production_method[0].produced
+        else:
+            return super().get_wiki_filename()
+
+        return advance.get_wiki_filename()
+
+    @cached_property
+    def tags(self) -> list[str]:
+        """All tags which are in the potential or allow with has_or_had_tag"""
+        tags = []
+        for condition_tree in (self.potential, self.allow):
+            if condition_tree:
+                for parents, tag in condition_tree.find_all_recursively_with_parents('has_or_had_tag'):
+                    if 'NOT' not in parents and 'NOR' not in parents and tag not in tags:
+                        tags.append(tag)
+        return tags
+
+    @cached_property
+    def countries(self) -> list['Country']:
+        """Tags -> Country if the tag exists"""
+        return [eu5game.parser.countries_including_formables[tag] for tag in self.tags if tag in eu5game.parser.countries_including_formables]
+
+    @cached_property
+    def unlock_lines(self) -> list[str]:
+        """One formatted line per unlock"""
+        unlocks = []
+        unlock_attributes = [attribute for attribute in Advance.all_annotations().keys() if attribute.startswith('unlock_')]
+        for unlock_attribute in unlock_attributes:
+            for unlock in getattr(self, unlock_attribute):
+                if unlock_attribute == 'unlock_production_method':
+                    if len(unlock.get_buildings()) > 1:
+                        raise Exception(f'Unlocked PM {unlock.name} in advance {self.name} has more than one building: {unlock.get_buildings()}')
+                    unlock_line = f'Production method {eu5game.parser.formatter.quote(unlock.display_name)} for {unlock.get_buildings()[0].get_wiki_link_with_icon()}'
+                elif isinstance(unlock, str):
+                    unlock_line = unlock
+                else:
+                    unlock_line = unlock.get_wiki_link_with_icon()
+                unlocks.append(unlock_line)
+        return unlocks
+
+
+def UnlockedByMixin(unlock_key: str):
+    class _:
+        @cached_property
+        def unlocked_by(self) -> list['Advance']:
+            return [
+                advance
+                for advance in eu5game.parser.advances.values()
+                if self in getattr(advance, unlock_key)
+            ]
+    return _
 
 class Resource(IconMixin):
     pass
@@ -493,6 +676,7 @@ class Good(Eu5AdvancedEntity, Resource):
     color: PdxColor
     custom_tags: list[str] = []
     default_market_price: float = 1
+    development_threshold: int = None
     demand_add: Tree = None
     demand_multiply: Tree = None
     food: float = 0
@@ -610,13 +794,15 @@ class NoPrice(Price):
         return ''
 
 
-class ProductionMethod(NameableEntity):
+class ProductionMethod(NameableEntity, UnlockedByMixin('unlock_production_method')):
     category: str
     input: list[Cost]
     no_upkeep: bool = False
     output: float = 0
     potential: Tree
     produced: Good = None
+
+    buildings: list['Building'] = None
 
     def format(self, icon_only=False):
         data = [
@@ -629,7 +815,15 @@ class ProductionMethod(NameableEntity):
         # return eu5game.parser.formatter.create_wiki_list(data)
         return [self.display_name, data]
 
+    def get_buildings(self) -> list['Building']:
+        if self.buildings is None:
+            # just to trigger building parsing which sets the building for the PMs
+            buildings = eu5game.parser.buildings
+        return self.buildings
+
+
 class Age(Eu5AdvancedEntity):
+    long_name: str  # e.g. Age of Traditions
     efficiency: float
     hegemons_allowed: bool = False
     max_ai_privilege_per_estate: Tree
@@ -644,10 +838,20 @@ class Age(Eu5AdvancedEntity):
 
     icon_folder = 'AGE_ICON_PATH'
 
+    def __lt__(self, other):
+        if isinstance(other, Age):
+            return self.year < other.year
+        else:
+            return super().__lt__(other)
+
+    def get_wiki_page_name(self) -> str:
+        return self.long_name
+
+
 class BuildingCategory(Eu5AdvancedEntity):
     icon_folder = 'building_categories'
 
-class Building(Eu5AdvancedEntity):
+class Building(Eu5AdvancedEntity, UnlockedByMixin('unlock_building')):
     AI_ignore_available_worker_flag: bool = False
     AI_optimization_flag_coastal: bool = False
     ai_foreign_ignore_naval_range: bool = False
@@ -680,6 +884,7 @@ class Building(Eu5AdvancedEntity):
     location_potential: Trigger = None
     market_center_modifier: list[Eu5Modifier] = []
     max_levels: ScriptValue
+    megalopolis: bool = False
     modifier: list[Eu5Modifier] = []
     need_good_relation: bool = False
     obsolete: list['Building'] = []
@@ -700,6 +905,14 @@ class Building(Eu5AdvancedEntity):
     unique_production_methods: list[list[ProductionMethod]] = []
     icon_folder = 'BUILDINGS_ICON_PATH'
 
+    def __init__(self, name: str, display_name: str, **kwargs):
+        super().__init__(name, display_name, **kwargs)
+        for pm_list in self.unique_production_methods + [self.possible_production_methods]:
+            for pm in pm_list:
+                if pm.buildings is None:
+                    pm.buildings = []
+                pm.buildings.append(self)
+
 
 class Climate(Eu5AdvancedEntity):
     always_winter: bool = False
@@ -718,12 +931,49 @@ class CountryDescriptionCategory(NameableEntity):
     pass
 
 
-class Country(Eu5AdvancedEntity):
-    # tag specific history from game/in_game/common/customizable_localization/country_history.txt
-    description: str = ''
+class BaseCountry(Eu5AdvancedEntity):
+    tag: str
+    adjective: str = ''
+    flag: 'CoatOfArms' = None
+    color: PdxColor = None
 
+    def __init__(self, name: str, display_name: str, **kwargs):
+        if 'adjective' not in kwargs:
+            kwargs['adjective'] = f'{name}_ADJ'
+        kwargs['adjective'] = eu5game.parser.localize(kwargs['adjective'])
+        super().__init__(name, display_name, **kwargs)
+
+    @classmethod
+    def has_wiki_icon(cls):
+        return True
+
+    def get_wiki_link_with_icon(self) -> str:
+        return f'{{{{flag|{self.display_name}}}}}'
+
+    @cached_property
+    def description(self) -> str:
+        """tag specific history
+         from game/in_game/common/customizable_localization/country_history.txt
+
+         Can't be done during parsing, because the localization references other countries
+        """
+        return eu5game.parser.tag_specific_descriptions.get(self.name, '')
+
+    @cached_property
+    def long_name(self) -> str:
+        """from _LONG localization.
+        "Rank of Name" if loc is not set
+
+        Can't be done during parsing, because it needs
+        the resolved country_rank and display_name
+
+         @TODO: possibly get the long name from the game
+        """
+        return eu5game.parser.localize(f'{self.name}_LONG', return_none_instead_of_default=True)
+
+
+class Country(BaseCountry):
     # From in_game/setup/countries
-    color: PdxColor
     color2: PdxColor = None
     culture_definition: 'Culture' = None  # only unset for special tags DUMMY, PIR and MER
     description_category: CountryDescriptionCategory = None
@@ -750,11 +1000,9 @@ class Country(Eu5AdvancedEntity):
     discovered_areas: list[Area] = []
     discovered_provinces: list[Province] = []
     discovered_regions: list[Region] = []
-    dynasty: str = ''
-    flag: str = None
+    dynasty: list['Dynasty'] = []
     government: Tree  # @TODO: government parsing
     # government.type: 'GovernmentType'
-    include: str = ''
     is_valid_for_release: bool = True
     liturgical_language: 'Language' = None
     our_cores_conquered_by_others: list[Location] = []
@@ -767,7 +1015,7 @@ class Country(Eu5AdvancedEntity):
     religious_school: 'ReligiousSchool' = None
     revolt: bool = False
     scholars: list['ReligiousSchool'] = []
-    starting_technology_level: int = None
+    starting_technology_level: int = 0
     timed_modifier: list[Tree] = None # TODO implement timed modifiers
     tolerated_cultures: list['Culture'] = []
     type: str = 'location'
@@ -777,10 +1025,39 @@ class Country(Eu5AdvancedEntity):
         if 'country_rank' not in kwargs:
             kwargs['country_rank'] = default_rank
         super().__init__(name, display_name, **kwargs)
-        if self.country_name:
+
+        # Normalize display names for special cases
+        if self.name == 'MAM':
+            # Always render as Egypt without the tag suffix
+            self.display_name = 'Egypt'
+        elif self.country_name and self.country_name != self.name:
             self.display_name = f'{eu5game.parser.localize(self.country_name)}({self.name})'
         if isinstance(self.timed_modifier, Tree):
             self.timed_modifier = [self.timed_modifier]
+
+        # Ensure PAP uses Papal States regardless of localized country_name
+        if self.name == 'PAP':
+            self.display_name = 'Papal States'
+
+        # Ensure PAP uses Papal States regardless of localized country_name
+        if self.name == 'PAP':
+            self.display_name = 'Papal States'
+
+    @cached_property
+    def long_name(self) -> str:
+        """from _LONG localization.
+        "Rank of Name" if loc is not set
+
+        Can't be done during parsing, because it needs
+        the resolved country_rank and display_name
+
+         @TODO: possibly get the long name from the game
+        """
+        from_loc = super().long_name
+        if from_loc is None:
+            return f'{self.country_rank.display_name} of {self.display_name}'
+        else:
+            return from_loc
 
     def has_flag(self, flag: str):
         if self.variables and 'data' in self.variables:
@@ -851,7 +1128,15 @@ class Estate(Eu5AdvancedEntity):
         return super().get_wiki_filename().replace(' estate.png', '.png')
 
 
-class EstatePrivilege(Eu5AdvancedEntity):
+class Dynasty(Eu5AdvancedEntity):
+    dynasty_name_type: str = ''
+    female_names: list[str] = []
+    home: Location
+    important: bool = False
+    male_names: list[str] = []
+
+
+class EstatePrivilege(Eu5AdvancedEntity, UnlockedByMixin('unlock_estate_privilege')):
     estate: Estate
 
     potential: Trigger = None
@@ -877,7 +1162,7 @@ class EstatePrivilege(Eu5AdvancedEntity):
         return 'Privilege'
 
 
-class HeirSelection(Eu5AdvancedEntity):
+class HeirSelection(Eu5AdvancedEntity, UnlockedByMixin('unlock_heir_selection')):
     all_in_country: bool = None
     all_in_dynasty: bool = None
     allow_children: bool = None
@@ -890,13 +1175,14 @@ class HeirSelection(Eu5AdvancedEntity):
     calc: ScriptValue = None
     candidate_country: Trigger = None
     custom_tags: list[str] = []
+    depth_first: bool = False
     heir_is_allowed: Trigger = None
     ignore_ruler: bool = False
     include_other_countries: Trigger = None
     include_ruler_siblings: bool = None
     locked: Trigger = None
     max_possible_candidates: int = None
-    modifier: Trigger = None
+    modifier: list[Eu5Modifier] = []
     potential: Trigger = None
     show_candidates: bool = True
     sibling_score: ScriptValue = None
@@ -908,6 +1194,13 @@ class HeirSelection(Eu5AdvancedEntity):
     use_mothers_dynasty: bool = False
 
     icon_folder = 'HEIR_SELECTION_ICON_PATH'
+
+    def get_wiki_filename_prefix(self) -> str:
+        return ''
+
+    def get_wiki_page_name(self) -> str:
+        return 'Succession laws'
+
 
 class Eu5GameConcept(GameConcept):
     family: str = ''
@@ -963,12 +1256,12 @@ class Language(Eu5AdvancedEntity):
     descendant_suffix: str = ''
     descendant_suffix_female: str = ''
     descendant_suffix_male: str = ''
-    dialects: 'Language' = None
+    dialects: dict[str, 'Language'] = None
     dynasty_names: list[str] = []
     dynasty_template_keys: list[str] = []
     fallback: 'Language' = None
     family: LanguageFamily = None
-    female_names: list[str] = []
+    female_names: dict[int, list[str]] = {} # weight -> list of names
     first_name_conjoiner: str = ''
     location_prefix: str = ''
     location_prefix_ancient: str = ''
@@ -977,7 +1270,7 @@ class Language(Eu5AdvancedEntity):
     location_prefix_vowel: str = ''
     location_suffix: str = ''
     lowborn: list[str] = []
-    male_names: list[str] = []
+    male_names: dict[int, list[str]] = {} # weight -> list of names
     patronym_prefix_daughter: str = ''
     patronym_prefix_daughter_vowel: str = ''
     patronym_prefix_son: str = ''
@@ -988,8 +1281,57 @@ class Language(Eu5AdvancedEntity):
     require_genitive_location_names: bool = False
     ship_names: list[str] = []
 
+    def __init__(self, name: str, display_name: str, **kwargs):
+        self.name = name # done here so that it can be used inthe namelist processing
+        for attribute in ['dynasty_names', 'lowborn']:
+            if attribute in kwargs:
+                name_list = kwargs[attribute]
+                kwargs[attribute] = self._localize_name_list(name_list)
+        for attribute in ['male_names', 'female_names']:
+            if attribute in kwargs:
+                kwargs[attribute] = self._create_weight_name_dict(kwargs[attribute])
+        super().__init__(name, display_name, **kwargs)
 
-class LawPolicy(Eu5AdvancedEntity):
+    def _localize_name(self, name: str):
+        localized_name = eu5game.parser.localize(f'{name}.{self.name}', return_none_instead_of_default=True)
+        if localized_name is None:
+            localized_name = eu5game.parser.localize(name, return_none_instead_of_default=True)
+        if localized_name is None:
+            if '.' in name:
+                localized_name = ' '.join(self._localize_name(name_part) for name_part in name.split('.'))
+            else:
+                localized_name = name
+        return eu5game.parser.formatter.resolve_nested_localizations(localized_name)
+
+    def _localize_name_list(self, name_list) -> list[str]:
+        return [self._localize_name(n) for n in name_list]
+
+    def _create_weight_name_dict(self, data) -> dict[int, list[str]]:
+        if isinstance(data, list):
+            if len(data) == 0:
+                return {}
+            if isinstance(data[0], str):
+                return {1: self._localize_name_list(data)}
+            else:
+                result = {}
+                for sublist in data:
+                    for weight, names in self._create_weight_name_dict(sublist).items():
+                        if weight in result:
+                            result[weight].extend(names)
+                        else:
+                            result[weight] = names
+                return result
+        elif isinstance(data, Tree):
+            weight = data['weight']['value']
+            names = data['remainder']
+            return {weight: self._localize_name_list(names)}
+        else:
+            raise Exception(f'Unsupported type "{type(data)}" for names list {data}')
+
+
+
+
+class LawPolicy(Eu5AdvancedEntity, UnlockedByMixin('unlock_policy')):
     law: 'Law'
     allow: Trigger = None
     country_modifier: list[Eu5Modifier]
@@ -998,6 +1340,7 @@ class LawPolicy(Eu5AdvancedEntity):
     years: int = 0
     weeks: int = 0
     days: int = 0
+    level: int = None
     on_activate: Effect = None
     on_deactivate: Effect = None
     on_pay_price: Effect = None
@@ -1033,18 +1376,19 @@ class LawPolicy(Eu5AdvancedEntity):
         return self.law.get_wiki_link_target()
 
 
-class Law(Eu5AdvancedEntity):
-    allow: Trigger = None  # trigger
+class Law(Eu5AdvancedEntity, UnlockedByMixin('unlock_law')):
+    allow: Trigger = None
     custom_tags: list[str] = []
+    has_levels: bool = False
     law_category: str = ''
-    law_country_group: str = None # tag
-    law_gov_group: str = None # gov type
-    law_religion_group: list[str] = [] # religions
-    locked: Trigger = None  # trigger
-    potential: Trigger = None  # trigger
+    law_country_group: Country = None
+    law_gov_group: GovernmentType = None
+    law_religion_group: list['Religion'] = []
+    locked: Trigger = None
+    potential: Trigger = None
     requires_vote: bool = None
     type: str = ''
-    unique: bool = None# no Idea what this does
+    unique: bool = None  # no Idea what this does
 
     policies: dict[str, LawPolicy]
 
@@ -1124,7 +1468,7 @@ class ReligiousAspect(Eu5AdvancedEntity):
     enabled: Trigger = None
     icon: str = '' # possible types(out of 95): <class 'str'>(95), <class 'eu5.eu5lib.ReligiousAspect'>(7)
     modifier: list[Eu5Modifier] = []
-    opinions: Tree = None
+    opinions: dict['ReligiousAspect', int] = None
     religion: list['Religion']
     visible: Trigger = None
 
@@ -1358,6 +1702,151 @@ class ScriptedList(Eu5AdvancedEntity):
     @cached_property
     def effects(self) -> list[str]:
         return [f'{prefix}_{self.name}' for prefix in ['every', 'ordered', 'random']]
+
+
+class TriggeredDesc(ParsableObject):
+    trigger: Trigger = None
+    desc: str
+
+    def __init__(self, desc: str = None, **kwargs):
+        self.desc = eu5game.parser.localize(desc)
+        super().__init__(**kwargs)
+
+
+class TriggeredTextHolder(ParsableObject):
+    desc: str = None  # if it is not actually triggered
+    localized_desc: str = None  # if it is not actually triggered
+    trigger: Trigger = None
+
+    first_valid: list['TriggeredTextHolder'] = []
+    random_valid: list['TriggeredTextHolder'] = []
+    triggered_desc: list['TriggeredTextHolder'] = []
+
+    def __init__(self, desc: str = None, **kwargs):
+        if isinstance(desc, list):
+            self.localized_desc = [eu5game.parser.localize(d) for d in desc]
+        elif desc is not None:
+            self.localized_desc = eu5game.parser.localize(desc)
+        super().__init__(desc=desc, **kwargs)
+
+    def __str__(self):
+        if self.desc is None:
+            desc = []
+        elif isinstance(self.localized_desc, list):
+            desc = self.localized_desc
+        else:
+            desc = [self.localized_desc]
+        desc.extend(str(triggered_desc) for triggered_desc in (self.first_valid + self.random_valid + self.triggered_desc))
+        return ' / '.join(desc)
+
+
+class EventOption(Eu5AdvancedEntity):
+    # name: str # could also be a list of names with trigger, but that is also unused
+    ai_chance: Tree = None
+    ai_will_select: ScriptValue = None
+    historical_option: bool = False
+    trigger: Trigger = None
+    effect: Effect = None
+
+    # unused according to event modding wiki article, but can be used for gui scripting in mods
+    high_risk_option: bool = False
+    high_reward_option: bool = False
+    moral_option: bool = False
+    evil_option: bool = False
+
+
+class DynamicHistoricalEvent(ParsableObject):
+    tag: list[str] = []
+    from_date: str = ''  # from is a reserved word
+    to_date: str = ''
+    monthly_chance: float
+
+    attribute_name_map = {
+        'from': 'from_date',  # from is a reserved word
+        'to': 'to_date'
+    }
+
+class Event(Eu5AdvancedEntity):
+    after: Effect = None
+    desc: TriggeredTextHolder = None
+    dynamic_historical_event: DynamicHistoricalEvent = None
+    fire_only_once: bool = False
+    hide_portraits: bool = None
+    historical_info: str = ''
+    illustration_tags: Tree = None
+    image: str = ''
+    immediate: Effect = None
+    major: bool = False
+    major_trigger: Trigger = None
+    option: dict[str, EventOption] = {}
+    title: TriggeredTextHolder
+    trigger: Trigger = None
+    type: str = None
+
+    event_file: 'EventFile'
+
+    @property
+    def event_id(self) -> str:  # for convenience
+        return self.name
+
+    @cached_property
+    def namespace(self) -> str:
+        return self.name.partition('.')[0]
+
+
+class EventFile(ParsableObject):
+    filename: str
+    path: Path
+    namespaces: list[str]
+    scripted_effects: dict[str, ScriptedEffect]
+    scripted_triggers: dict[str, ScriptedTrigger]
+    events: dict[str, Event]
+
+
+class DLC(Eu5AdvancedEntity):
+    name: str
+    path: Path
+    picture: str
+    checksum: str
+    description: str
+    supported_version: str
+    dependencies: list[str]
+    replace_path: list[str]
+    tags: list[str]
+    pops_id: str
+    msgr_id: str
+    steam_id: int
+    review_steam_id: int
+    affects_save_compatibility: bool
+    mp_synced: bool
+    third_party_content: bool
+    enabled: bool
+    hidden: bool
+    verify: bool
+
+    @classmethod
+    def has_wiki_icon(cls) -> bool:
+        return True
+
+    def get_icon_path(self) -> Path:
+        return self.path / self.picture
+
+    def get_wiki_filename_prefix(self) -> str:
+        return 'DLC'
+
+    def get_wiki_filename(self) -> str:
+
+        return f'{self.get_wiki_filename_prefix()} {self.display_name}.png'
+
+
+class BaseGame(DLC):
+    name = 'eu5_base_game'
+    display_name = 'Europa Universalis V'
+
+    def __init__(self, path):
+        super().__init__(self.name, self.display_name, path=path)
+
+
 ############################################
 #                                          #
 #  Autogenerated classes with helper.py    #
@@ -1367,6 +1856,14 @@ class Achievement(Eu5AdvancedEntity):
     happened: Trigger
     possible: Trigger
     icon_folder = 'achievements' # 50 / 50 icons found
+
+    def get_wiki_filename(self) -> str:
+        prefix = self.get_wiki_filename_prefix()
+        filename = f'{prefix} {self.display_name.lower()}.png'
+
+        return eu5game.parser.formatter.normalize_page_title(filename, False)
+
+
 class AiDiplochance(Eu5AdvancedEntity):
     actor_at_war: int = 0
     actor_is_rival: int = 0
@@ -1484,7 +1981,7 @@ class Bias(Eu5AdvancedEntity):
     yearly_decay: float = None
     yearly_gain: float = 0
     years: int = 0
-class CabinetAction(Eu5AdvancedEntity):
+class CabinetAction(Eu5AdvancedEntity, UnlockedByMixin('unlock_cabinet_action')):
     ability: str
     ai_will_do: ScriptValue = None
     allow: Trigger = None
@@ -1508,10 +2005,10 @@ class CabinetAction(Eu5AdvancedEntity):
     years: int = 0
     icon_folder = 'CABINET_ACTION_ICON_PATH' # 52 / 63 icons found
     # icon_folder = 'modifier_types' # 19 / 63 icons found
-class CasusBelli(Eu5AdvancedEntity):
-    additional_war_enthusiasm: float = 0
-    additional_war_enthusiasm_attacker: float = 0
-    additional_war_enthusiasm_defender: float = 0
+class CasusBelli(Eu5AdvancedEntity, UnlockedByMixin('unlock_casus_belli')):
+    additional_war_enthusiasm: ScriptValue = None
+    additional_war_enthusiasm_attacker: ScriptValue = None
+    additional_war_enthusiasm_defender: ScriptValue = None
     ai_cede_location_desire: ScriptValue = None
     ai_cede_province_desire: ScriptValue = None
     ai_selection_desire: ScriptValue = None
@@ -1532,9 +2029,22 @@ class CasusBelli(Eu5AdvancedEntity):
     visible: Trigger = None
     war_goal_type: 'Wargoal'
     icon_folder = 'CASUS_BELLI_ICON_PATH' # 30 / 92 icons found
+
+    def get_wiki_filename_prefix(self) -> str:
+        return 'Cb'
+
+
 class CoatOfArms(Eu5AdvancedEntity):
-    pass
-class CharacterInteraction(Eu5AdvancedEntity):
+    color1: PdxColor = None
+    color2: PdxColor = None
+    color3: PdxColor = None
+    color4: PdxColor = None
+    color5: PdxColor = None
+    colored_emblem: list[Tree] = []
+    pattern: str = ''
+    sub: Tree = None
+    textured_emblem: list[Tree] = []
+class CharacterInteraction(Eu5AdvancedEntity, UnlockedByMixin('unlock_interaction')):
     ai_tick: Any = None # possible types(out of 27): <class 'str'>(26), list[str](1)
     ai_tick_frequency: int = 0
     ai_will_do: ScriptValue = None
@@ -1557,7 +2067,13 @@ class ChildEducation(Eu5AdvancedEntity):
     modifier: list[Eu5Modifier]
     price_to_deselect: Price = None
     price_to_select: Price = None
-class CountryInteraction(Eu5AdvancedEntity):
+class ChivalricOrder(Eu5AdvancedEntity, UnlockedByMixin('unlock_chivalric_order')):
+    character_eligible: Trigger
+    character_modifier: list[Eu5Modifier]
+    country_modifier: list[Eu5Modifier]
+    potential: Trigger = None
+    icon_folder = 'CHIVALRIC_ORDER_ICON_PATH' # 15 / 15 icons found
+class CountryInteraction(Eu5AdvancedEntity, UnlockedByMixin('unlock_country_interaction')):
     accept: ScriptValue = None
     ai_limit_per_check: int = 0
     ai_prerequisite: Trigger = None
@@ -1684,22 +2200,46 @@ class Ethnicity(Eu5AdvancedEntity):
     skin_color: Tree
     template: 'Ethnicity' = None
 class FlagDefinition(Eu5AdvancedEntity):
-    flag_definition: list[Tree] = []
+    allow_overlord_canton: bool = False
+    coa: CoatOfArms
+    coa_with_overlord_canton: str = None  # should be CoatOfArms, but the only case where it is used references a non-existing coa
+    overlord_canton_scale: list[float] = []
+    priority: int
+    random_select_if_same_priority: bool = False
+    subject_canton: CoatOfArms = None
+    trigger: Trigger = None
 
-    def __init__(self, name: str, display_name: str, **kwargs):
-        if isinstance(kwargs['flag_definition'], Tree):
-            kwargs['flag_definition'] = [kwargs['flag_definition']]
-        super().__init__(name, display_name, **kwargs)
+    parent: 'FlagDefinitionList'
+    dummy: bool = False  # for countries which don't have a flag definition and instead use the coa for their tag
 
-class FormableCountry(Eu5AdvancedEntity):
-    adjective: str = '' # possible types(out of 129): <class 'str'>(129), <class 'eu5.eu5lib.CustomizableLocalization'>(12)
+    @cached_property
+    def country(self) -> Country|None:
+        return self.parent.country
+
+
+@dataclass
+class FlagDefinitionList:
+    tag: str
+    flag_definitions: list[FlagDefinition] = field(default_factory=list)
+    parser: Any = None
+
+    def __post_init__(self):
+        for flag_def in self.flag_definitions:
+            flag_def.parent = self
+
+    @cached_property
+    def country(self) -> Country|None:
+        if self.tag in self.parser.countries_including_formables:
+            return self.parser.countries_including_formables[self.tag]
+        else:
+            return None
+
+class FormableCountry(BaseCountry):
     allow: Trigger = None
     areas: list[Area] = []
     capital_required: bool = True
-    color: PdxColor = None
     continents: list[str] = []
     country_name: str  # name in the script
-    flag: CoatOfArms = None
     form_effect: Effect
     level: int
     locations: list[Location] = []
@@ -1709,7 +2249,8 @@ class FormableCountry(Eu5AdvancedEntity):
     required_locations_fraction: float = 0
     rule: str
     sub_continents: list[SubContinent] = []
-    tag: str
+
+
 class GameRule(Eu5AdvancedEntity):
     default: str = ''
     options: list = []  # TODO: parsing
@@ -1751,7 +2292,7 @@ class God(Eu5AdvancedEntity):
     icon_folder = 'GOD_ICON_PATH' # 23 / 112 icons found
 class GoodsDemandCategory(Eu5AdvancedEntity):
     display: Any # possible types(out of 4): <class 'str'>(3), <class 'eu5.eu5lib.AttributeColumn'>(1), <class 'eu5.eu5lib.Eu5GameConcept'>(1)
-class GovernmentReform(Eu5AdvancedEntity):
+class GovernmentReform(Eu5AdvancedEntity, UnlockedByMixin('unlock_government_reform')):
     age: Age = None
     allow: Trigger = None
     block_for_rebel: bool = False
@@ -1827,7 +2368,7 @@ class InternationalOrganizationSpecialStatus(Eu5AdvancedEntity):
     priority: int
     special_status_power: Any = None # possible types(out of 16): <class 'eu5.eu5lib.ScriptValue'>(15), <class 'eu5.eu5lib.Eu5GameConcept'>(1), <class 'eu5.eu5lib.Eu5ModifierType'>(1), <class 'eu5.eu5lib.TriggerLocalization'>(1)
     icon_folder = 'INTERNATIONAL_ORGANIZATION_SPECIAL_STATUS_ICON_PATH' # 23 / 24 icons found
-class Levy(Eu5AdvancedEntity):
+class Levy(Eu5AdvancedEntity, UnlockedByMixin('unlock_levy')):
     allow: Trigger = None
     allow_as_crew: Trigger = None
     allowed_culture: list[Culture] = []
@@ -1858,11 +2399,21 @@ class Mission(Eu5AdvancedEntity):
     icon_folder = 'MISSION_ILLUSTRATION_PATH' # 6 / 11 icons found
 class OnAction(Eu5AdvancedEntity):
     effect: Effect = None
-    events: Any = None # possible types(out of 34): list[str](33), <class 'list'>(1)
+    # TODO: should be list[Event], but delay needs to be handled somehow
+    events: list[Any] = []
+    fallback: 'OnAction' = None
+    first_valid: list[Event] = []
+    first_valid_on_action: list['OnAction'] = []
     on_actions: list['OnAction'] = []
-    random_events: Tree = None
-    random_on_action: Any = None
+    random_events: list[tuple[int, Event]] # Events with their weight
+    # the next three are scripted inside random_events, but are moved
+    # to the top level of the OnAction for easier handling
+    random_events_chance_of_no_event: ScriptValue = None
+    random_events_chance_to_happen: float|int = 0
+    random_events_sample_count: int = 0
+    random_on_action: list[tuple[int, 'OnAction']] # OnActions with their weight
     trigger: Trigger = None
+    weight_multiplier: ScriptValue = None
 class ParliamentAgenda(Eu5AdvancedEntity):
     ai_will_do: ScriptValue = None
     allow: Trigger = None
@@ -1975,7 +2526,7 @@ class Resolution(Eu5AdvancedEntity):
 
 class RivalCriteria(Eu5AdvancedEntity):
     enabled: Trigger
-class RoadType(Eu5AdvancedEntity):
+class RoadType(Eu5AdvancedEntity, UnlockedByMixin('unlock_road_type')):
     build_time_per_unit_distance: int
     color: PdxColor
     construction_demand: GoodsDemand
@@ -1987,6 +2538,14 @@ class RoadType(Eu5AdvancedEntity):
     proximity: int = 0
     spline_style_id: int
     icon_folder = 'ROAD_ICON_PATH' # 4 / 4 icons found
+
+    def get_wiki_filename_prefix(self) -> str:
+        return ''
+
+    def get_wiki_page_name(self) -> str:
+        return 'Road'
+
+
 class Scenario(Eu5AdvancedEntity):
     country: Country
     flag: str = None
@@ -2017,9 +2576,7 @@ class ScriptedDiplomaticObjective(Eu5AdvancedEntity):
     recipient_priority: ScriptValue
     recipient_trigger: Trigger
     spy_network_target: int = 0
-class ScriptedEffect(Eu5AdvancedEntity):
-    pass
-class ScriptedRelation(Eu5AdvancedEntity):
+class ScriptedRelation(Eu5AdvancedEntity, UnlockedByMixin('unlock_relation_type')):
     annulled_by_peace_treaty: bool = False
     block_building: bool = False
     block_when_at_war: bool = None
@@ -2084,8 +2641,7 @@ class ScriptedRelation(Eu5AdvancedEntity):
     wants_to_receive: ScriptValue = None
     wants_to_receive_diplo_chance: Tree = None
     will_expire_trigger: Trigger = None
-class ScriptedTrigger(Eu5AdvancedEntity):
-    pass
+
 class Situation(Eu5AdvancedEntity):
     can_end: Trigger
     can_start: Trigger
@@ -2118,22 +2674,54 @@ class SocietalValue(Eu5AdvancedEntity):
     left_modifier: list[Eu5Modifier]
     right_modifier: list[Eu5Modifier]
 
+    def format(self, value: int|float, comparison_operator: str = '='):
+        flipped_operators = {
+            '<': '>',
+            '≤': '≥',
+            '>': '<',
+            '≥': '≤',
+        }
+        if not isinstance(value, Number):
+          side = self
+        elif value < 0:
+            side = self.left
+            value = value * -1
+            comparison_operator = flipped_operators[comparison_operator]
+        elif value == 0:
+            if comparison_operator in ['<', '≤']:
+                side = self.left
+                comparison_operator = flipped_operators[comparison_operator]
+            elif comparison_operator in ['>', '≥']:
+                side = self.right
+            else:
+                side = self
+        else:  # value > 0:
+            side = self.right
+
+        return f'{side.get_wiki_link_with_icon()} {comparison_operator} {value}'
 
 class SocietalValueOneSide(Eu5AdvancedEntity):
     name: str  # e.g. centralization_vs_decentralization_left
     short_name: str # e.g. centralization
     modifier: list[Eu5Modifier]
     societal_value: SocietalValue
+    side: str  # left | right
     icon_folder = 'SOCIETAL_VALUE_ICON_PATH'
     # icon_folder = 'SOCIETAL_VALUE_ILLUSTRATION_PATH'
 
-    def get_icon_filename(self, left_or_right: str) -> str:
-        assert left_or_right in ['left', 'right']
-        return f'{self.name}_{left_or_right}.dds'
+    def __init__(self, name: str, display_name: str, **kwargs):
+        assert kwargs['side'] in ['left', 'right']
+        super().__init__(name, display_name, **kwargs)
 
-    def get_wiki_filename(self, left_or_right: str) -> str:
-        assert left_or_right in ['left', 'right']
-        return super().get_wiki_filename()
+    def get_icon_filename(self) -> str:
+        return f'{self.name}_{self.side}.dds'
+
+    def get_wiki_filename(self) -> str:
+        return f'Societal value {self.short_name}.png'
+
+    def get_wiki_page_name(self) -> str:
+        return 'Societal Value'
+
 
 class SubjectMilitaryStance(Eu5AdvancedEntity):
     army_logistics_priority: int
@@ -2163,7 +2751,7 @@ class SubjectMilitaryStance(Eu5AdvancedEntity):
     support_armies_priority: int
     support_sieges_priority: int = None
     suppress_rebel_priority: int
-class SubjectType(Eu5AdvancedEntity):
+class SubjectType(Eu5AdvancedEntity, UnlockedByMixin('unlock_subject_type')):
     ai_wants_to_be_overlord: ScriptValue = None
     allow_declaring_wars: bool = False
     annexation_min_opinion: int = 0
@@ -2171,6 +2759,7 @@ class SubjectType(Eu5AdvancedEntity):
     annexation_speed: float = 1
     annexation_stall_opinion: int = 0
     can_attack: Trigger = None
+    can_be_annexed: bool = True
     can_be_force_broken_in_peace_treaty: bool = True
     can_change_heir_selection: bool
     can_change_rank: bool
@@ -2220,10 +2809,18 @@ class SubjectType(Eu5AdvancedEntity):
     use_overlord_laws: bool = False
     use_overlord_map_color: bool = None
     use_overlord_map_name: bool = True
-    visible_through_diplomacy: Trigger
+    visible_through_diplomacy: Trigger = None
     visible_through_treaty: Trigger = None
     war_score_cost: float = 0
     icon_folder = 'SUBJECT_TYPES_ICON_PATH' # 19 / 19 icons found
+class TownRights(Eu5AdvancedEntity, UnlockedByMixin('unlock_town_rights')):
+    allow: Trigger = None
+    color: PdxColor
+    country_modifier: list[Eu5Modifier] = []
+    kept_at_conquest: bool = True
+    location_modifier: list[Eu5Modifier]
+    potential: Trigger = None
+    icon_folder = 'TOWN_RIGHTS_ICON_PATH' # 42 / 50 icons found
 class TownSetup(Eu5AdvancedEntity):
     building_counts: dict[Building, int]  # TODO: parsing
 class Trait(Eu5AdvancedEntity):
@@ -2244,7 +2841,7 @@ class TriggerLocalization(Eu5AdvancedEntity):
     none_not: str = ''
     third: str = '' # possible types(out of 1252): <class 'str'>(1252), <class 'eu5.eu5lib.TriggerLocalization'>(4)
     third_not: str = ''
-class UnitAbility(Eu5AdvancedEntity):
+class UnitAbility(Eu5AdvancedEntity, UnlockedByMixin('unlock_ability')):
     ai_will_do: ScriptValue = None
     ai_will_revoke: ScriptValue = None
     allow: Trigger
@@ -2264,6 +2861,11 @@ class UnitAbility(Eu5AdvancedEntity):
     start_effect: Effect = None
     toggle: bool
     icon_folder = 'UNIT_ABILITY_ICON_PATH' # 14 / 15 icons found
+
+    def get_wiki_filename_prefix(self) -> str:
+        return ''
+
+
 class UnitCategory(Eu5AdvancedEntity):
     ai_weight: float
     anti_piracy_warfare: float = 0
@@ -2299,7 +2901,17 @@ class UnitCategory(Eu5AdvancedEntity):
     icon_folder = 'UNIT_CATEGORY_ICON_PATH' # 8 / 8 icons found
     # icon_folder = 'UNIT_BATTLE_CATEGORY_ICON_PATH' # 8 / 8 icons found
     # icon_folder = 'UNIT_TYPE_ILLUSTRATION_MASK_PATH' # 6 / 8 icons found
-class UnitType(Eu5AdvancedEntity):
+    def get_wiki_filename_prefix(self) -> str:
+        return ''
+
+    def get_wiki_page_name(self) -> str:
+        if self.is_army:
+            return 'Army'
+        else:
+            return 'Navy'
+
+
+class UnitType(Eu5AdvancedEntity, UnlockedByMixin('unlock_unit')):
     age: Age = None
     artillery_barrage: int = 0
     attrition_loss: float = 0
@@ -2371,6 +2983,26 @@ class UnitType(Eu5AdvancedEntity):
             return eu5game.parser.unit_types[self._upgrades_to_only]
         else:
             return None
+
+    @cached_property
+    def category(self) -> UnitCategory|None:
+        """Fallback in case the unit has no category itself"""
+        if self.copy_from is None:
+            return None
+        else:
+            return self.copy_from.category
+
+
+    def get_wiki_filename(self) -> str:
+        if self.category is None:
+            return ''
+        else:
+            return self.category.get_wiki_filename()
+
+    def get_wiki_page_name(self) -> str:
+        return self.category.get_wiki_page_name()
+
+
 class Wargoal(Eu5AdvancedEntity):
     attacker: Tree = None
     defender: Tree = None # possible types(out of 32): <class 'common.paradox_parser.Tree'>(31), list[common.paradox_parser.Tree](1)
