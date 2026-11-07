@@ -11,12 +11,19 @@ class Eu5Localizer(JominiLocalizer):
         'BGP': 'Burgundy (BGP)',
         'MAM': 'Egypt (MAM)',
         'MGE': 'Mongol Empire',
+        'DAU': 'Dauphiné',
+        'GLH': 'Golden Horde',
+        'PAL': 'Palatinate',
+        'PAP': 'Papal States',
     }
 
     def __init__(self, game_installation: Path, language: str = 'english'):
         localization_files = list((game_installation / 'game' / 'main_menu' / 'localization' / language).glob(
             f'**/*_l_{language}.yml'))
-        dlc_locs = list((game_installation / 'game' / 'dlc').glob(f'*/main_menu/localization/dlc/{language}/**/*_l_{language}.yml'))
+        # There seem to be two schemas for DLC locs
+        # D000 has them in game/dlc/D000_shared/main_menu/localization/dlc/english
+        # FotP and AtP have them in game/dlc/*/main_menu/localization/english
+        dlc_locs = list((game_installation / 'game' / 'dlc').glob(f'*/main_menu/localization/**/{language}/**/*_l_{language}.yml'))
         localization_files.extend(dlc_locs)
 
         self.localization_folder_iterator = iter(localization_files)

@@ -1,9 +1,11 @@
 import re
+from typing import Collection
 
 from common.paradox_lib import NameableEntity
 from common.paradox_parser import Tree
 from eu5.eu5lib import Resource, HardcodedResource, Eu5AdvancedEntity
 from eu5.game import eu5game
+from eu5.trigger import TriggerBlock
 from vic3.text_formatter import Vic3WikiTextFormatter
 
 
@@ -20,21 +22,27 @@ class Eu5WikiTextFormatter(Vic3WikiTextFormatter):
         return f'{{{{icon|{icon_key}}}}}'
 
 
-    def _resolve_data_function(self, data_function: str, parameter: str, name_function: str = None):
+    def _resolve_data_function(self, data_function: str, parameter: str, name_function: str|None = None, format_str: str|None = None) -> str:
         if data_function in ['GetEstateNameWithNoTooltip', 'GetEstateName']:
-            return self.parser.estates[parameter].display_name
-        if data_function in ['ShowSocietyDirectionName']:
-            return self.parser.localize(f'{parameter}_focus')
-        if data_function == 'GetCountry' and name_function in ['GetAdjectiveWithNoTooltip', 'GetAdjective']:
-            return self.parser.localize(f'{parameter}_ADJ')
-        if data_function == 'GetCountry' and name_function in ['GetLongName', 'GetLongNameWithNoTooltip'] and parameter in self.parser.countries:
-            return self.parser.countries[parameter].long_name
-        return self.parser.localize(parameter)
+            result = self.parser.estates[parameter].display_name
+        elif data_function in ['ShowSocietyDirectionName']:
+            result =self.parser.localize(f'{parameter}_focus')
+        elif data_function == 'GetCountry' and name_function in ['GetAdjectiveWithNoTooltip', 'GetAdjective']:
+            result =self.parser.localize(f'{parameter}_ADJ')
+        elif data_function == 'GetCountry' and name_function in ['GetLongName', 'GetLongNameWithNoTooltip'] and parameter in self.parser.countries:
+            result =self.parser.countries[parameter].long_name
+        else:
+            result = self.parser.localize(parameter)
+
+        if format_str:
+            result = self._apply_formatting_markers(format_str, result)
+
+        return result
 
     def apply_localization_formatting(self, text: str) -> str:
         text = super().apply_localization_formatting(text)
-        text = re.sub(r"\[\s*(?P<data_function>(Show|Get)[a-zA-Z_]+)\s*\(\s*'(?P<loc_key>[^']+)'\s*\)(.(?P<name_function>(GetNameWithNoTooltip|GetLongNameWithNoTooltip|GetLongName|GetShortNameWithNoTooltip|GetAdjectiveWithNoTooltip|GetAdjective)))?\s*]",
-                      lambda match: self._resolve_data_function(match.group('data_function'), match.group('loc_key'), match.group('name_function')), text)
+        text = re.sub(r"\[\s*(?P<data_function>(Show|Get)[a-zA-Z_]+)\s*\(\s*'(?P<loc_key>[^']+)'\s*\)(.(?P<name_function>(GetNameWithNoTooltip|GetLongNameWithNoTooltip|GetLongName|GetShortNameWithNoTooltip|GetAdjectiveWithNoTooltip|GetAdjective)))?\s*(\|(?P<format>[^]|()[]+)\s*)?]",
+                      lambda match: self._resolve_data_function(match.group('data_function'), match.group('loc_key'), match.group('name_function'), match.group('format')), text)
 
         return text
 
@@ -43,6 +51,13 @@ class Eu5WikiTextFormatter(Vic3WikiTextFormatter):
         text = re.sub(r"\\n\$BULLET_WITH_TAB\$", '\n* ', text)
         text = re.sub(r"\\n\$BULLET\$", '\n* ', text)
         return super().resolve_nested_localizations(text, seen_keys)
+
+    def get_concept_link(self, match: re.Match) -> str:
+        concept_name = match.group('concept_name').removesuffix('_with_icon')
+        if concept_name in self.parser.game_concepts:
+            return super().get_concept_link(match)
+        else:
+            return match.group(0)
 
     def format_resource(self, resource: str | Resource, value=None, cost=False, icon_only=False, add_plus=False):
         if  isinstance(resource, str):
@@ -70,6 +85,11 @@ class Eu5WikiTextFormatter(Vic3WikiTextFormatter):
     def format_cost(self, resource: str, value: int, icon_only=False):
         return self.format_resource(resource, value, cost=True, icon_only=icon_only)
 
+    def format_conditions(self, conditions: Tree, indent: int = 1):
+        if isinstance(conditions, TriggerBlock):
+            conditions = conditions.triggers
+        return super().format_conditions(conditions, indent)
+
     def format_trigger(self, trigger: Tree|None):
         if not trigger:
             return ''
@@ -92,17 +112,21 @@ class Eu5WikiTextFormatter(Vic3WikiTextFormatter):
         if isinstance(value, Tree) and len(value) == 1 and list(value.keys())[0] in comparison_operators:
             for comparison_str, comparison_value in value:
                 comparison_operator = comparison_operators[comparison_str]
-                if key.startswith('societal_value:'):
-                    typ, _, key_without_prefix = key.partition(':')
-                    return self.parser.societal_values[key_without_prefix].format(comparison_value, comparison_operator)
+                if isinstance(comparison_value, str) or not isinstance(comparison_value, Collection):
+                    if key.startswith('societal_value:'):
+                        typ, _, key_without_prefix = key.partition(':')
+                        return self.parser.societal_values[key_without_prefix].format(comparison_value, comparison_operator)
+                    else:
+                        return f'{key} {comparison_operator} {self.format_RHS(comparison_value)}'
         if key in self.parser.scripted_triggers and value is True:
-            return self.format_conditions(self.parser.scripted_triggers[key].trigger, indent)
+            return self.format_conditions(self.parser.scripted_triggers[key].triggers, indent)
         
         return super().format_key_value_pair(key, value, indent)
 
     def format_simple_statement(self, key, value):
         mapping = {
             'has_or_had_tag': ('Is or was {value}', self.parser.countries_including_formables),
+            'tag': ('Is {value}', self.parser.countries_including_formables),
             'country_exists': ('{value} exists', self.parser.countries_including_formables),
             'has_reform': ('Has the {value} Government Reform', self.parser.government_reforms),
             'country_has_estate': ('Has the {value} estate', self.parser.estates),

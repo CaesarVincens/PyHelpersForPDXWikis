@@ -53,9 +53,7 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
                       text)
         return text
 
-    def _apply_formatting_markers(self, match: re.Match) -> str:
-        format_key = match.group(1).lower()
-        text = match.group(2)
+    def _apply_formatting_markers(self, format_key: str, text: str) -> str:
         replacements = {'p': '{{{{green|{}}}}}',
                         'g': '{{{{green|{}}}}}',
                         'n': '{{{{red|{}}}}}',
@@ -65,7 +63,11 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
                         'b': "'''{}'''",
                         'italic': "''{}''",
                         'tooltippable': '{}',
+                        'l': "''{}''",  # L underlines text, we use italics instead
                         'v': '{}',  # white
+                        'w': '{}',  # white
+                        't': '{}',  # tooltip_label
+                        'f': '{}',  # flavor
                         'y': '{}',  # zero_value / white
                         'z': '{}',  # zero_value / white
                         'e': '{}',  # explanation_link in ck3 / TODO: this is normally blue, but we don't want to make it blue if it is a normal link, because they are already blue
@@ -73,11 +75,15 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
                         'indent_newline:3': '\n&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{}',
                         'indent_newline:4': '\n&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;{}',
                         }
-        if format_key not in replacements:
-            Vic3FileGenerator.warn('ignoring unknown formatting marker {} in "{}"'.format(format_key, match.group(0)))
+        if format_key == 'U':  # overrides l
+            return self.uc_first(text)
+        if format_key == 'l':  # not L. That's why we don't do format_key.lower() before
+            return self.lc_first(text)
+        if format_key.lower() not in replacements:
+            Vic3FileGenerator.warn('ignoring unknown formatting marker {} in "{}"'.format(format_key, text))
             return text
         else:
-            return replacements[format_key].format(text)
+            return replacements[format_key.lower()].format(text)
 
     def _replace_icons(self, match: re.Match) -> str:
         icon_key = match.group(1).lower()
@@ -170,11 +176,18 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
                         'merchant_marine': 'merchant marine',
                         'warning': 'warning',
                         }
-        if icon_key not in replacements:
+        icons_to_remove = [
+            'divider_start',
+            'divider_mid',
+            'divider_end',
+        ]
+        if icon_key in icons_to_remove:
+            return ''
+        elif icon_key in replacements:
+            return '{{icon|' + replacements[icon_key] + '}}'
+        else:
             Vic3FileGenerator.warn('unknown icon {} in "{}"'.format(icon_key, match.group(0)))
             return match.group(0)
-        else:
-            return '{{icon|' + replacements[icon_key] + '}}'
 
     def _replace_defines(self, match: re.Match) -> str:
         category = match.group('category')
@@ -189,26 +202,54 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
         formatting = match.group('formatting')
         if not formatting:
             return str(value)
-        if 'K' in formatting:
+        formatting = formatting.lower()
+        if 'k' in formatting:
             value = value / 1000
             suffix = 'K'
-        if '%' in formatting:
+        elif '%' in formatting:
             value = value * 100
             suffix = '%'
-        if '=-' in formatting:
+        if '=' in formatting:
             if value > 0:
-                prefix = '{{red|+' + prefix
-                suffix += '}}'
+                prefix = '+' + prefix
             elif value < 0:
-                prefix = '{{green|' + prefix
-                suffix += '}}'
-        if '=+' in formatting:
+                prefix = '−' + prefix
+        if 'g' in formatting:
+            prefix = '{{green|' + prefix
+            suffix += '}}'
+        elif 'r' in formatting:
+            prefix = '{{red|' + prefix
+            suffix += '}}'
+        elif '+' in formatting:
             if value > 0:
-                prefix = '{{green|+' + prefix
+                prefix = '{{green|' + prefix
                 suffix += '}}'
             elif value < 0:
                 prefix = '{{red|' + prefix
                 suffix += '}}'
+        elif '-' in formatting:
+            if value > 0:
+                prefix = '{{red|' + prefix
+                suffix += '}}'
+            elif value < 0:
+                prefix = '{{green|' + prefix
+                suffix += '}}'
+        elif 'v' in formatting:  # normally white
+            prefix = "''" + prefix
+            suffix += "''"
+
+        if '5' in formatting:
+            value = f'{value:.5g}'
+        elif '4' in formatting:
+            value = f'{value:.4g}'
+        elif '3' in formatting:
+            value = f'{value:.3g}'
+        elif '2' in formatting:
+            value = f'{value:.2g}'
+        elif '1' in formatting:
+            value = f'{value:.1g}'
+        elif '0' in formatting:
+            value = f'{value:.0f}'
 
         return '{}{}{}'.format(prefix, value, suffix)
 
@@ -234,11 +275,11 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
         while previous_text != new_text:
             previous_text = new_text
             # only matches the inner formatting. The others will be done in future loops
-            new_text = re.sub(r'#(\S+) ([^#]+)#!', self._apply_formatting_markers, previous_text)
+            new_text = re.sub(r'#(\S+) ([^#]+)#!', lambda match: self._apply_formatting_markers(match.group(1), match.group(2)), previous_text)
 
         text = re.sub(r'@([^!]*)!', self._replace_icons, new_text)
         text = re.sub(r"\[\s*Get[a-zA-Z_]+\s*\(\s*'([^']+)'\s*\).GetTextIcon\s*]", self._replace_icons, text)
-        text = re.sub(r"\[\s*GetDefine\s*\(\s*'(?P<category>[^']*)'\s*,\s*'(?P<define>[^']*)'\s*\)\s*(\|\s*(?P<formatting>[-vK0+=%W]+))?\s*]",
+        text = re.sub(r"\[\s*GetDefine\s*\(\s*'(?P<category>[^']*)'\s*,\s*'(?P<define>[^']*)'\s*\)\s*(\|\s*(?P<formatting>[-vVgGrRyYK012345+=%W]+))?\s*]",
                       self._replace_defines, text)
         text = re.sub(r"\[\s*Get[a-zA-Z_]+\s*\(\s*'(?P<loc_key>[^']+)'\s*\).GetName(?:NoFormatting)?\s*]",
                       lambda match: self.parser.localize(match.group('loc_key')), text)
@@ -263,7 +304,7 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
         # so we replace till nothing changes anymore (and hope that there is no loop)
         while previous_text != new_text:
             previous_text = new_text
-            new_text = re.sub(r'\$([^$]*)\$', resolve_replacement, previous_text)
+            new_text = re.sub(r'\$([^$]*?)(\|q)?\$', resolve_replacement, previous_text)
             new_text = re.sub(r"\[Localize\('([^']+)'\)]", resolve_replacement, new_text, flags=re.IGNORECASE)
 
         return new_text
@@ -287,13 +328,15 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
         return f'[[{link}|{display_str}]]'
 
 
-    def strip_formatting(self, text, strip_newlines=False):
-        return super().strip_formatting(self.format_localization_text(text, []), strip_newlines)
+    def strip_formatting(self, text, strip_newlines=False, strip_bold = False, strip_italics = False):
+        return super().strip_formatting(self.format_localization_text(text, []), strip_newlines, strip_bold, strip_italics)
 
     def localize_concept_name(self, concept_name):
         return self.parser.localize(concept_name)
 
     def format_conditions(self, conditions: Tree, indent: int = 1):
+        if not conditions:
+            return ''
         result = []
         for key, value in conditions.iterate_with_duplicates():
             result.append(self.format_key_value_pair(key, value, indent))

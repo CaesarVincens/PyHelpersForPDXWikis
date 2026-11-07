@@ -9,10 +9,11 @@ import json
 import os
 import re
 import subprocess
+from operator import attrgetter
 from pathlib import Path
-from collections.abc import MutableMapping
+from collections.abc import MutableMapping, Iterable
 from tempfile import mkstemp
-from typing import Callable, Any, Iterator
+from typing import Callable, Any, Iterator, Sequence
 
 try:  # when used by PyHelpersForPDXWikis
     from PyHelpersForPDXWikis.localsettings import RAKALY_CLI
@@ -119,12 +120,17 @@ class ParadoxParser:
         Returns:
             the merged Tree
         """
-        result = Tree({})
         glob = '*.' + file_extension
         if recursive:
             glob = '**/' + glob
         glob = f'{folder}/{glob}'
-        for file in sorted(self.base_folder.glob(glob)):
+        files = self.base_folder.glob(glob)
+        return self._parse_multiple_files_as_one_file(files, overwrite_duplicate_keys_at_level, workarounds)
+
+    def _parse_multiple_files_as_one_file(self, files: Iterable[Path], overwrite_duplicate_keys_at_level: int | None,
+                                          workarounds: list[ParsingWorkaround] | None) -> Tree:
+        result = Tree({})
+        for file in sorted(files, key=attrgetter('name')):
             if overwrite_duplicate_keys_at_level == 0:
                 result.dictionary.update(self._really_parse_file(file, workarounds).dictionary)
             else:
@@ -179,7 +185,8 @@ class ParadoxParser:
             raise Exception('Error reading "{}": {}'.format(file, rakaly_error_message))
         return self.json_to_tree(rakaly_result.stdout)
 
-    def parse_ordered_pairs_into_tree(self, ordered_pairs) -> 'Tree|TreeWithDuplicates':
+    @staticmethod
+    def parse_ordered_pairs_into_tree(ordered_pairs) -> 'Tree|TreeWithDuplicates':
         """
         Returns a Tree from the ordered pairs
 
@@ -232,6 +239,20 @@ class Tree(MutableMapping):
 
     def __len__(self) -> int:
         return len(self.dictionary)
+
+    def _internal_str(self, indent: str = "") -> str:
+        base = ""
+        iter_list = list(self.iterate_with_duplicates())
+        for i, (key, node) in enumerate(iter_list):
+            first_char = "└" if i == len(iter_list)-1 else "├"
+            is_tree = isinstance(node,Tree)
+            base += f"{indent}{first_char}{key} {node if not is_tree else ""}\n"
+            if is_tree:
+                base += Tree._internal_str(node, indent=indent + "│" * (i != len(iter_list)-1) + "\t")
+        return base
+
+    def __str__(self) -> str:
+        return self._internal_str()
 
     def __iter__(self) -> Iterator:
         """iterates over the items of the dictionary.
@@ -292,19 +313,19 @@ class Tree(MutableMapping):
                     if isinstance(item, Tree):
                         yield from item.find_all_recursively(search_key)
 
-    def find_all_recursively_with_parents(self, search_key: str, parents: list[str] = None) -> Iterator[tuple[list[str], Any]]:
+    def find_all_recursively_with_parents(self, search_keys: Sequence[str], parents: list[str] = None) -> Iterator[tuple[list[str], Any]]:
         """Like find_all_recursively, but also returns the keys which were descended to find the search term"""
         if parents is None:
             parents = []
         for key, value in self.iterate_with_duplicates():
-            if key == search_key:
+            if key in search_keys:
                 yield parents, value,
             elif isinstance(value, Tree):
-                yield from value.find_all_recursively_with_parents(search_key, parents + [key])
+                yield from value.find_all_recursively_with_parents(search_keys, parents + [key])
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, Tree):
-                        yield from item.find_all_recursively_with_parents(search_key, parents + [key])
+                        yield from item.find_all_recursively_with_parents(search_keys, parents + [key])
 
     def merge_duplicate_keys(self):
         """merges duplicate keys which have Tree as their value
@@ -316,7 +337,8 @@ class Tree(MutableMapping):
             if isinstance(value, list) and len(value) > 0 and isinstance(value[0], Tree):
                 merged = Tree({})
                 for item in value:
-                    merged.dictionary.update(item.dictionary)
+                    if item:
+                        merged.dictionary.update(item.dictionary)
                 self.dictionary[key] = merged
         return self
 

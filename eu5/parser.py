@@ -15,8 +15,20 @@ from common.wiki_image import WikiImage, WikiImageFile, WikiImageFileReference
 from eu5.eu5lib import *
 from common.jomini_parser import JominiParser
 from common.paradox_lib import NE, AE, ME
-from common.paradox_parser import ParsingWorkaround, ScriptedWorkaround, TreeWithDuplicates
+from common.paradox_parser import ParsingWorkaround, ScriptedWorkaround, TreeWithDuplicates, ParadoxParser
 from eu5.localization import Eu5Localizer
+
+class Eu5ParadoxParser(ParadoxParser):
+
+    def parse_folder_as_one_file(self, folder: str, recursive=True, file_extension='txt',
+                                 workarounds: list[ParsingWorkaround] = None,
+                                 overwrite_duplicate_keys_at_level: int | None = 0) -> 'Tree':
+        glob = '*.' + file_extension
+        if recursive:
+            glob = '**/' + glob
+        glob = f'{folder}/{glob}'
+        files = list(self.base_folder.glob(glob)) + list(self.base_folder.glob(f'dlc/*/{glob}'))
+        return self._parse_multiple_files_as_one_file(files, overwrite_duplicate_keys_at_level, workarounds)
 
 
 class Eu5Parser(JominiParser):
@@ -31,7 +43,8 @@ class Eu5Parser(JominiParser):
     localizer: Eu5Localizer
 
     def __init__(self, game_installation: Path = EU5DIR, language: str = 'english'):
-        super().__init__(game_installation / 'game' )
+        self.parser = Eu5ParadoxParser(game_installation / 'game')
+        self._entity_reference_cache = {}
         self.localizer = Eu5Localizer(game_installation, language)
 
     @cached_property
@@ -41,6 +54,13 @@ class Eu5Parser(JominiParser):
 
     def localize_and_format(self, key):
         return self.formatter.format_localization_text(self.localize(key))
+
+    def _parse_entity_value(self, key, value, name, class_attributes, entity_class, entity_values: dict[Any, Any],
+                            transform_value_functions) -> Any:
+        if key in class_attributes and class_attributes[key] == TriggerBlock:
+            return TriggerBlock(value)
+        return super()._parse_entity_value(key, value, name, class_attributes, entity_class, entity_values,
+                                           transform_value_functions)
 
     def parse_nameable_entities(self, folder: str, entity_class: Type[NE], extra_data_functions: dict[str, Callable[[str, Tree], Any]] = None,
                                 transform_value_functions: dict[str, Callable[[Any], Any]] = None, entity_level: int = 0,
@@ -200,6 +220,28 @@ class Eu5Parser(JominiParser):
         })
 
     @cached_property
+    def bookmarks(self) -> dict[str, Bookmark]:
+        return self.parse_advanced_entities('main_menu/common/bookmarks', Bookmark,
+                                            localization_suffix='_name',
+                                            description_localization_suffix='_desc')
+
+    @cached_property
+    def default_bookmark(self) -> Bookmark:
+        start_date = self.defines['NGame']['START_DATE']
+        if not self.bookmarks:
+            return Bookmark(
+                'default_bookmark',
+                'Dummy Bookmark for game versions which dont support multiple bookmarks',
+                start_date=start_date,
+                end_date=self.defines['NGame']['END_DATE'],
+                setup_folder='setup/start',
+            )
+        for bookmark in self.bookmarks.values():
+            if bookmark.start_date == start_date:
+                return bookmark
+        raise Exception(f'No bookmark found for NGame.START_DATE "{start_date}"')
+
+    @cached_property
     def building_category(self) -> dict[str, BuildingCategory]:
             return self.parse_advanced_entities('in_game/common/building_categories', BuildingCategory, allow_empty_entities=True)
 
@@ -250,60 +292,63 @@ class Eu5Parser(JominiParser):
         continents = {
             name: Continent(name,
                             self.formatter.strip_formatting(self.localize(name), strip_newlines=True),
-                            sub_continents=self._update_and_return_new_elements(
-                                sub_continents,
-                                self._parse_sub_continents(name, data, regions, areas, provinces)
-                            ))
+                            sub_continents=self._parse_sub_continents(name, data)
+                            )
             for name, data in self.parser.parse_file(
                 'in_game/map_data/' + self.default_map.get_or_default('setup', 'definitions.txt')
             )
         }
+        for continent in continents.values():
+            sub_continents.update(continent.sub_continents)
+            for sub_continent in continent.sub_continents.values():
+                regions.update(sub_continent.regions)
+                for region in sub_continent.regions.values():
+                    areas.update(region.areas)
+                    for area in region.areas.values():
+                        provinces.update(area.provinces)
+
         return continents, sub_continents, regions, areas, provinces
 
-    def _parse_sub_continents(self, continent_name, continent_data, regions, areas, provinces):
-        return {
-            sub: SubContinent(sub,
-                              self.formatter.strip_formatting(self.localize(sub), strip_newlines=True),
-                              _continent=continent_name,
-                              regions=self._update_and_return_new_elements(
-                                  regions,
-                                  self._parse_regions(sub, sub_data, areas, provinces)))
-            for sub, sub_data in continent_data
-        }
+    def _parse_map_definitions(self, parent_name, parent_data, map_entity_class: type[MapDataEntity],
+                               sub_entities_parser: Callable) -> dict[str, MapDataEntity]:
+        map_entities = {}
+        for entity_name, entity_data in parent_data:
+            if 'not_eligible_for_dynamic_country_name' in entity_data:
+                not_eligible_for_dynamic_country_name = entity_data['not_eligible_for_dynamic_country_name']
+                del entity_data['not_eligible_for_dynamic_country_name']
+                if len(entity_data) == 1 and 'remainder' in entity_data:
+                    entity_data = entity_data['remainder']
+            else:
+                not_eligible_for_dynamic_country_name = False
+            map_entities[entity_name] = map_entity_class(
+                entity_name,
+                self.formatter.strip_formatting(self.localize(entity_name), strip_newlines=True),
+                _parent_entity_name=parent_name,
+                _child_entities=sub_entities_parser(
+                    entity_name,
+                    entity_data
+                ),
+                not_eligible_for_dynamic_country_name=not_eligible_for_dynamic_country_name,
+            )
+        return map_entities
 
-    def _parse_regions(self, sub_continent_name, sub_continent_data, areas, provinces):
-        return {
-            region_name: Region(region_name,
-                                self.formatter.strip_formatting(self.localize(region_name), strip_newlines=True),
-                                _sub_continent=sub_continent_name,
-                                areas=self._update_and_return_new_elements(
-                                    areas,
-                                    self._parse_areas(region_name, region_data, provinces)
-                                ))
-            for region_name, region_data in sub_continent_data
-        }
+    def _parse_sub_continents(self, continent_name, continent_data):
+        return self._parse_map_definitions(continent_name, continent_data, SubContinent, self._parse_regions)
 
+    def _parse_regions(self, sub_continent_name, sub_continent_data):
+        return self._parse_map_definitions(sub_continent_name, sub_continent_data, Region, self._parse_areas)
 
-    def _parse_areas(self, region_name, region_data, provinces):
-        return {
-            area_name: Area(area_name,
-                            self.formatter.strip_formatting(self.localize(area_name), strip_newlines=True),
-                            _region=region_name,
-                            provinces=self._update_and_return_new_elements(provinces, self._parse_provinces(area_name, area_data)))
-            for area_name, area_data in region_data
-        }
+    def _parse_areas(self, region_name, region_data):
+        return self._parse_map_definitions(region_name, region_data, Area, self._parse_provinces)
+
 
     def _parse_provinces(self, area_name, area_data):
-        return {
-            province_name:
-                Province(province_name,
-                         self.formatter.strip_formatting(self.localize(province_name), strip_newlines=True),
-                         _area=area_name,
-                         locations={location: self.locations[location] for
+        return self._parse_map_definitions(area_name, area_data, Province, self._parse_locations)
+
+    def _parse_locations(self, province_name, province_data):
+        return {location: self.locations[location] for
                                     location in
-                                    locations}
-                         ) for province_name, locations in area_data
-        }
+                                    province_data}
 
     @staticmethod
     def _update_and_return_new_elements(original: dict, new_elements: dict) -> dict:
@@ -399,8 +444,9 @@ class Eu5Parser(JominiParser):
         for filename, template in template_data_without_include.items():
             template_data[filename] = self._resolve_includes(template, template_data, template_data_without_include)
 
+        setup_start_folder = f'main_menu/{self.default_bookmark.setup_folder}/'
         return self._resolve_includes(self._fix_law_values(self.parser.parse_folder_as_one_file(
-            'main_menu/setup/start/',
+            setup_start_folder,
             overwrite_duplicate_keys_at_level=None
         )),
             template_data,
@@ -743,7 +789,7 @@ class Eu5Parser(JominiParser):
                                                 'historical_info': self.localize_and_format,
                                                 'option': lambda option: self.parse_advanced_entities(
                                                     Tree({
-                                                        option_data['name']: option_data
+                                                        option_data['name'] if isinstance(option_data['name'], str) else option_data['name'][0]['text']: option_data
                                                         for option_data in (
                                                             option if isinstance(option, list) else [option]
                                                         )
@@ -1112,6 +1158,12 @@ class Eu5Parser(JominiParser):
     def auto_modifiers(self) -> dict[str, AutoModifier]:
         return self.parse_advanced_entities('in_game/common/auto_modifiers', AutoModifier,
                                             localization_prefix='AUTO_MODIFIER_NAME_', # Used in 74/74 Examples: {'AUTO_MODIFIER_NAME_positive_yanantin': 'Positive [yanantin|e]', 'AUTO_MODIFIER_NAME_positive_harmony': 'Yáng'}
+                                            extra_data_functions={
+                                                'modifier': lambda name, data: self._parse_modifier_data(
+                                                    Tree({name: value for name, value in data if
+                                                          name not in ['category', 'limit', 'potential_trigger', 'requires_real', 'scales_with', 'type', 'alert']}),
+                                                    modifier_class=Eu5Modifier),
+                                            }
                                             )
     @cached_property
     def avatars(self) -> dict[str, Avatar]:
@@ -1249,7 +1301,7 @@ class Eu5Parser(JominiParser):
                                             # localization_prefix='', localization_suffix='', # Used in 127/127 Examples: {'denmark_f': 'Denmark', 'MGE_f': '$MGE$'}
                                             description_localization_prefix='', description_localization_suffix='_desc', # Used in 125/127 Examples: {'WES_f_desc': "With the clerical influences over our lands slowly fading into the past it is time to form a new state for [ShowAreaName('westphalia_area')] and proclaim a new era for our people.", 'PUN_f_desc': "We must unite the [ShowCultureName('punjabi')] people if we are ever to be able to stand against foreign invaders. Together we will build a modern state with armies capable of taking on the many enemies who would attack us for our lands, and who would do anything to extinguish our faith!"}
                                             extra_data_functions={
-                                                'country_name': lambda name, data: data['name'] if 'name' in data else data['tag'],
+                                                'country_name': lambda name, data: data.get('name')
                                             }
                                             )
     @cached_property
@@ -1522,7 +1574,7 @@ class Eu5Parser(JominiParser):
     @cached_property
     def scripted_triggers(self) -> dict[str, ScriptedTrigger]:
         extra_data_functions = {
-            'trigger': lambda name, data: Trigger(data.dictionary)
+            'triggers': lambda name, data: data
         }
         triggers = self.parse_advanced_entities('main_menu/common/scripted_triggers', ScriptedTrigger, extra_data_functions=extra_data_functions)
         triggers.update(self.parse_advanced_entities('in_game/common/scripted_triggers', ScriptedTrigger, extra_data_functions=extra_data_functions))
@@ -1570,6 +1622,13 @@ class Eu5Parser(JominiParser):
                                             # localization_prefix='', localization_suffix='', # Used in 19/19 Examples: {'tributary': 'Tributary', 'appanage': 'Appanage'}
                                             description_localization_prefix='', description_localization_suffix='_desc', # Used in 19/19 Examples: {'trade_company_desc': "A $trade_company$ is an investment conglomerate, directed at incurring monetary benefits for itself and its [overlord|e]. They are always a [ShowGovernmentTypeName('republic')] and get increased [ShowModifierTypeName('trade_efficiency')], as well as increased payment obligations to their overlord compared to a regular [ShowSubjectTypeName('vassal')].", 'dominion_desc': "A $dominion$ is a self-governed [subject|e] with relative autonomy, exclusive for a [ShowGovernmentTypeName('monarchy')] of the same [religion_group|e] as the [overlord|e]. Additionally, to be able to create a $dominion$, both countries must be in a [union|e] or the overlord must be either $ENG$ or $GBR$. A $dominion$ enjoys increased [ShowModifierTypeName('country_cabinet_efficiency')], a bigger increase compared to a regular [ShowSubjectTypeName('vassal')]."}
                                             )
+
+    @cached_property
+    def text_icons(self):
+        return self.parse_nameable_entities('main_menu/gui/shared/font_icons.gui', TextIcon, extra_data_functions={
+            'name': lambda a, data: data['icon']
+        })
+
     @cached_property
     def town_rights(self) -> dict[str, TownRights]:
         return self.parse_advanced_entities('in_game/common/town_rights', TownRights,
@@ -1654,7 +1713,43 @@ class Eu5Parser(JominiParser):
                     f'Unit illustration {file.stem.replace("_", " ").strip()}.png',
                     'Unit illustrations',
                     f'Uploaded from {{{{path|{relative_path}|{top_folder}}}}}.',
-                    True,
+                    False,
+                    image_reference=file,
+                    image_data_hash=hashlib.sha256(file.read_bytes()).hexdigest(),
+                ))
+
+        for work_of_art in self.artist_work.values():
+            file = work_of_art.get_illustration_path()
+            if file.exists():
+                relative_path = file.relative_to(self.parser.base_folder)
+                top_folder = relative_path.parts[0]
+                relative_path = relative_path.relative_to(top_folder)
+                image_file_references.append(WikiImageFileReference(
+                    work_of_art.get_wiki_illustration_filename(),
+                    'Work of art illustrations',
+                    f'Uploaded from {{{{path|{relative_path}|{top_folder}}}}}.',
+                    # some images are duplicates, but we can't say which is the main one
+                    # WikiImageFile uses the first file if none are the main file reference
+                    is_main_reference=False,
+                    image_reference=file,
+                    image_data_hash=hashlib.sha256(file.read_bytes()).hexdigest(),
+                ))
+
+        entities_with_default_icons = {
+            'Town rights icons': self.town_rights,
+        }
+        for category, entity_dict in entities_with_default_icons.items():
+            entity = next(iter(entity_dict.values()))
+            file = entity.get_default_icon_path()
+            if file.exists():
+                relative_path = file.relative_to(self.parser.base_folder)
+                top_folder = relative_path.parts[0]
+                relative_path = relative_path.relative_to(top_folder)
+                image_file_references.append(WikiImageFileReference(
+                    entity.get_default_wiki_filename(),
+                    category,
+                    f'Default icon for {entity.get_class_name_as_wiki_page_title()}. Uploaded from {{{{path|{relative_path}|{top_folder}}}}}.',
+                    is_main_reference=False,
                     image_reference=file,
                     image_data_hash=hashlib.sha256(file.read_bytes()).hexdigest(),
                 ))
@@ -1672,3 +1767,56 @@ class Eu5Parser(JominiParser):
 
         return [WikiImage([image_file]) for image_file in
                 sorted(image_files.values(), key=attrgetter('main_wiki_filename'))]
+
+
+    @cached_property
+    def historical_earthquakes(self) -> dict[str,HistoricalEarthquake]:
+        events = {event_id: event for event_id, event in self.events.items() if "earthquake" in event_id}
+        historical_earthquakes = {}
+        for event_id, event in events.items():
+            location = None
+            possible_start = None
+            possible_end = None
+            for key, node in event.trigger.iterate_with_duplicates():
+                if key == "owns":
+                    location = self.locations[node.removeprefix("location:")]
+                elif key == "current_year" or key == "current_date":
+                    for key2, node2 in node.iterate_with_duplicates():
+                        if key2.startswith("GREATER_THAN"):
+                            possible_start = node2
+                        elif key2.startswith("LESS_THAN"):
+                            possible_end = node2
+                        else:
+                            raise ValueError(key2)
+                else:
+                    break
+
+            severity = None
+
+            for option_key in event.option:
+                if "major" in option_key:
+                    severity = "Major"
+                elif "minor" in option_key:
+                    severity = "Minor"
+                elif "catastrophic" in option_key or "catastrophy" in option_key:
+                    severity = "Catastrophic"
+                else:
+                    severity = "Special"
+            if (
+                location is None
+                or possible_start is None
+                or possible_end is None
+                or severity is None
+            ):
+                # print(f"Event {event.name} does not match the pattern")
+                continue
+            else:
+                historical_earthquakes[event_id] = HistoricalEarthquake(
+                    event_id=event_id,
+                    location=location,
+                    possible_start=possible_start,
+                    possible_end=possible_end,
+                    severity=severity,
+                )
+        return historical_earthquakes
+

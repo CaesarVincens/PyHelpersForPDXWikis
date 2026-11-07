@@ -654,7 +654,7 @@ class Vic3Parser(JominiParser):
                      'pays_taxes', 'is_government_funded', 'created_by_trade_routes', 'subsidized', 'is_military',
                      'default_building', 'ignores_productivity_when_hiring',
                      'min_productivity_to_hire', 'owns_other_buildings', 'always_self_owning', 'has_trade_revenue', 'company_headquarter', 'regional_company_headquarter',
-                     'construction_efficiency_modifier', 'self_investment_chance_modifier', 'builds_ships']:
+                     'construction_efficiency_modifier', 'self_investment_chance_modifier', 'builds_ships', 'reserves_arable_land']:
                 entity_values[k] = v
             elif k == 'parent_group':
                 entity_values['parent_group'] = parsed_building_groups[v]
@@ -775,7 +775,7 @@ class Vic3Parser(JominiParser):
     @cached_property
     def achievements(self) -> dict[str, Achievement]:
         return self.parse_advanced_entities('common/achievements', Achievement, extra_data_functions={
-            'display_name': lambda name, data: self.localize(f'ACHIEVEMENT_{name}'),
+            'display_name': lambda name, data: self.formatter.strip_formatting(self.localize(f'ACHIEVEMENT_{name}'), True, True, True),
             'description': lambda name, data: self.localize(f'ACHIEVEMENT_DESC_{name}')
         })
 
