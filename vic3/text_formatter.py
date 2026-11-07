@@ -84,6 +84,7 @@ class Vic3WikiTextFormatter(WikiTextFormatter):
         replacements = {'aut': 'authority',
                         'bur': 'bureaucracy',
                         'construction': 'construction',
+                        'ship_construction': 'ship_construction',
                         'green_checkmark_box': 'yes',
                         'inf': 'influence',
                         'information': 'info',

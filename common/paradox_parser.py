@@ -172,7 +172,8 @@ class ParadoxParser:
             return self._run_rakaly(file)
 
     def _run_rakaly(self, file: Path):
-        rakaly_result = subprocess.run([RAKALY_CLI, 'json', '--format', 'utf-8', '--interpolation', '--duplicate-keys', 'preserve', file], capture_output=True)
+        #EU5rakaly_result = subprocess.run([RAKALY_CLI, 'json', '--format', 'utf-8', '--interpolation', '--duplicate-keys', 'preserve', file], capture_output=True)
+        rakaly_result = subprocess.run([RAKALY_CLI, 'json', '--format', 'utf-8', '--duplicate-keys', 'group', file], capture_output=True)
         if rakaly_result.returncode != 0:
             rakaly_error_message = str(rakaly_result.stderr, 'UTF-8')[:-1]  # [:-1] removes the final linebreak
             raise Exception('Error reading "{}": {}'.format(file, rakaly_error_message))

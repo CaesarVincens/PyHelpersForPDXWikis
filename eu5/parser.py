@@ -60,9 +60,9 @@ class Eu5Parser(JominiParser):
     def parse_advanced_entities(self, folder: str|Tree, entity_class: Type[AE], extra_data_functions: dict[str, Callable[[str, Tree], Any]] = None,
                                 transform_value_functions: dict[str, Callable[[Any], Any]] = None, localization_prefix: str = '', allow_empty_entities=False,
                                 parsing_workarounds: list[ParsingWorkaround] = None,
+                                localization_suffix: str = '',
                                 description_localization_prefix: str = None,
                                 description_localization_suffix: str = '_desc',
-                                localization_suffix: str = '',
                                 ) -> dict[str, AE]:
         if extra_data_functions is None:
             extra_data_functions = {}

@@ -422,5 +422,26 @@ local p = {};
                             table_classes=['wikitable', 'plainlist'],
                             )
         return self.get_version_header() + '\n{{clear}}\n' + table
+    
+    def generate_amendment_table(self):
+        amendments = []
+        for amendment in self.parser.amendments.values():
+            table_entry = {
+                'Name': f'{amendment.display_name}',
+                'Parent law': f'{{{{law|{amendment.parent}}}}}' if not None else 'None',
+                'Allowed laws': self.create_wiki_list(sorted(f'{{{{law|{law.display_name}}}}}' for law in amendment.allowed_laws)),
+                'Conditions': self.parser.formatter.format_conditions(amendment.possible) if amendment.possible else '',
+                'Repeal': self.parser.formatter.format_conditions(amendment.can_repeal) if amendment.can_repeal else '',
+                'Modifiers': self.create_wiki_list([modifier.format_for_wiki() for modifier in amendment.modifier]),
+                'Institution modifiers': self.create_wiki_list([modifier.format_for_wiki() for modifier in amendment.institution_modifier]),
+                'Sponsor modifiers': self.create_wiki_list([modifier.format_for_wiki() for modifier in amendment.sponsor_modifier]),
+            }
+            amendments.append(table_entry)
+        table = self.make_wiki_table(amendments,
+                            table_classes=['wikitable', 'plainlist'],
+                            one_line_per_cell=True,
+                            )
+        return self.get_version_header() + '\n{{clear}}\n' + table
+        
 if __name__ == '__main__':
     TableGenerator().run(sys.argv)

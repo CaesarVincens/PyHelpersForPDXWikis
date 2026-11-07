@@ -1024,6 +1024,23 @@ class Country(BaseCountry):
     def __init__(self, name: str, display_name: str, default_rank: 'CountryRank', **kwargs):
         if 'country_rank' not in kwargs:
             kwargs['country_rank'] = default_rank
+        #if kwargs['setup_data']:
+        #    for k, v in kwargs['setup_data']:
+        #        if k in kwargs:
+        #            print(f'Error: duplicate key {k} in {name}. Orig_value: "{kwargs[k]}"; setup_value: "{v}"')
+        #        else:
+        #            kwargs[k] = v
+
+        if 'capital' in kwargs:
+            capital_value = kwargs['capital']
+            # Some setup entries provide lists; pick the first entry
+            if isinstance(capital_value, list) and len(capital_value) > 0:
+                capital_value = capital_value[0]
+            if isinstance(capital_value, str):
+                # Setup data can leave capital as a string; resolve to a Location object when possible
+                capital_value = eu5game.parser.locations.get(capital_value, capital_value)
+            kwargs['capital'] = capital_value
+
         super().__init__(name, display_name, **kwargs)
 
         # Normalize display names for special cases
